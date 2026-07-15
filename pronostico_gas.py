@@ -27,6 +27,8 @@ DEFAULT_INPUT_FILE_NAMES = [
 DEFAULT_SECTORAL_IPC_NAME = "ipc_sectorial_panama_2017_2025.xlsx"
 DEFAULT_OUTPUT_NAME = "pronostico_combustibles_panama_web.xlsx"
 IPC_SOURCE_URL = "https://www.inec.gob.pa/publicaciones/Default3.aspx?ID_CATEGORIA=4&ID_PUBLICACION=1396&ID_SUBCATEGORIA=82"
+WORLD_BANK_API_BASE = "https://api.worldbank.org/v2"
+WORLD_BANK_DATA_URL = "https://data.worldbank.org"
 PRICE_UNIT = "B/./litro"
 MIN_REASONABLE_PRICE = 0.05
 MAX_REASONABLE_PRICE = 10.0
@@ -58,6 +60,34 @@ IPC_SECTOR_NAMES = {
     "ipc_restaurantes": "Restaurantes y hoteles",
     "ipc_bienes_servicios": "Bienes y servicios diversos",
 }
+REGIONAL_COUNTRIES = {
+    "PAN": "Panamá",
+    "CRI": "Costa Rica",
+    "DOM": "República Dominicana",
+}
+REGIONAL_INDICATORS = {
+    "LP.LPI.OVRL.XQ": "Índice de desempeño logístico (1–5)",
+    "TM.VAL.FUEL.ZS.UN": "Importaciones de combustibles (% de mercancías)",
+    "PA.NUS.FCRF": "Tipo de cambio oficial (moneda local/USD)",
+    "FP.CPI.TOTL.ZG": "Inflación general anual (%)",
+}
+REGIONAL_FALLBACK_ROWS = [
+    {"codigo_pais": "PAN", "indicador": "LP.LPI.OVRL.XQ", "anio": 2022, "valor": 3.1},
+    {"codigo_pais": "CRI", "indicador": "LP.LPI.OVRL.XQ", "anio": 2022, "valor": 2.9},
+    {"codigo_pais": "DOM", "indicador": "LP.LPI.OVRL.XQ", "anio": 2022, "valor": 2.6},
+    {"codigo_pais": "PAN", "indicador": "TM.VAL.FUEL.ZS.UN", "anio": 2024, "valor": 19.9706022981},
+    {"codigo_pais": "CRI", "indicador": "TM.VAL.FUEL.ZS.UN", "anio": 2024, "valor": 10.2627314710},
+    {"codigo_pais": "DOM", "indicador": "TM.VAL.FUEL.ZS.UN", "anio": 2024, "valor": 16.6433167112},
+    {"codigo_pais": "PAN", "indicador": "FP.CPI.TOTL.ZG", "anio": 2024, "valor": 0.6932255510},
+    {"codigo_pais": "CRI", "indicador": "FP.CPI.TOTL.ZG", "anio": 2024, "valor": -0.4128530010},
+    {"codigo_pais": "DOM", "indicador": "FP.CPI.TOTL.ZG", "anio": 2024, "valor": 3.3022333895},
+    {"codigo_pais": "PAN", "indicador": "PA.NUS.FCRF", "anio": 2023, "valor": 1.0},
+    {"codigo_pais": "CRI", "indicador": "PA.NUS.FCRF", "anio": 2023, "valor": 544.0507755056},
+    {"codigo_pais": "DOM", "indicador": "PA.NUS.FCRF", "anio": 2023, "valor": 56.1576},
+    {"codigo_pais": "PAN", "indicador": "PA.NUS.FCRF", "anio": 2024, "valor": 1.0},
+    {"codigo_pais": "CRI", "indicador": "PA.NUS.FCRF", "anio": 2024, "valor": 515.1097719214},
+    {"codigo_pais": "DOM", "indicador": "PA.NUS.FCRF", "anio": 2024, "valor": 59.5651333333},
+]
 MONTH_NUMBERS = {
     "enero": 1,
     "febrero": 2,
@@ -528,6 +558,237 @@ def create_ipc_lag_figure(ccf_df: pd.DataFrame, sector: str):
     return fig
 
 
+@st.cache_data(ttl=86_400, show_spinner=False)
+def fetch_world_bank_indicator(indicator: str, start_year: int = 2018) -> pd.DataFrame:
+    """Consulta una serie anual comparable para los tres países del bloque regional."""
+    if indicator not in REGIONAL_INDICATORS:
+        raise ValueError(f"Indicador regional no permitido: {indicator}")
+
+    country_codes = ";".join(REGIONAL_COUNTRIES)
+    url = f"{WORLD_BANK_API_BASE}/country/{country_codes}/indicator/{indicator}"
+    response = requests.get(
+        url,
+        params={
+            "format": "json",
+            "per_page": 500,
+            "date": f"{start_year}:{pd.Timestamp.today().year}",
+        },
+        timeout=15,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; FuelForecastPrototype/2.0)"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], list):
+        raise ValueError("La API del Banco Mundial no devolvió observaciones válidas.")
+
+    records: list[dict[str, Any]] = []
+    for observation in payload[1]:
+        value = observation.get("value")
+        country_code = observation.get("countryiso3code")
+        year = observation.get("date")
+        if country_code not in REGIONAL_COUNTRIES or value is None or not str(year).isdigit():
+            continue
+        records.append(
+            {
+                "codigo_pais": country_code,
+                "pais": REGIONAL_COUNTRIES[country_code],
+                "indicador": indicator,
+                "indicador_nombre": REGIONAL_INDICATORS[indicator],
+                "anio": int(year),
+                "valor": float(value),
+            }
+        )
+    if not records:
+        raise ValueError(f"No hay observaciones regionales para {indicator}.")
+    return pd.DataFrame(records).sort_values(["codigo_pais", "anio"]).reset_index(drop=True)
+
+
+def regional_fallback_data() -> pd.DataFrame:
+    fallback = pd.DataFrame(REGIONAL_FALLBACK_ROWS)
+    fallback["pais"] = fallback["codigo_pais"].map(REGIONAL_COUNTRIES)
+    fallback["indicador_nombre"] = fallback["indicador"].map(REGIONAL_INDICATORS)
+    return fallback[["codigo_pais", "pais", "indicador", "indicador_nombre", "anio", "valor"]]
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def load_regional_benchmark() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Construye un benchmark regional; usa una instantánea oficial si la API no responde."""
+    frames: list[pd.DataFrame] = []
+    source_status = "API del Banco Mundial"
+    try:
+        for indicator in REGIONAL_INDICATORS:
+            frames.append(fetch_world_bank_indicator(indicator))
+        raw = pd.concat(frames, ignore_index=True)
+    except (requests.RequestException, ValueError, TypeError):
+        raw = regional_fallback_data()
+        source_status = "instantánea oficial de respaldo (consulta 2026-07-15)"
+
+    rows: list[dict[str, Any]] = []
+    for country_code, country_name in REGIONAL_COUNTRIES.items():
+        country_data = raw[raw["codigo_pais"] == country_code]
+        row: dict[str, Any] = {"codigo_pais": country_code, "pais": country_name}
+        for indicator, prefix in {
+            "LP.LPI.OVRL.XQ": "lpi",
+            "TM.VAL.FUEL.ZS.UN": "importacion_combustible_pct",
+            "FP.CPI.TOTL.ZG": "inflacion_pct",
+        }.items():
+            latest = country_data[country_data["indicador"] == indicator].sort_values("anio").tail(1)
+            if latest.empty:
+                row[prefix] = np.nan
+                row[f"{prefix}_anio"] = np.nan
+            else:
+                row[prefix] = float(latest["valor"].iloc[0])
+                row[f"{prefix}_anio"] = int(latest["anio"].iloc[0])
+
+        fx = country_data[country_data["indicador"] == "PA.NUS.FCRF"].sort_values("anio").tail(2)
+        if len(fx) == 2 and float(fx["valor"].iloc[0]) != 0:
+            row["variacion_cambiaria_pct"] = (
+                float(fx["valor"].iloc[1]) / float(fx["valor"].iloc[0]) - 1
+            ) * 100
+            row["variacion_cambiaria_anio"] = int(fx["anio"].iloc[1])
+        else:
+            row["variacion_cambiaria_pct"] = np.nan
+            row["variacion_cambiaria_anio"] = np.nan
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    normalized = summary[["codigo_pais", "pais"]].copy()
+
+    def minmax(series: pd.Series, invert: bool = False, absolute: bool = False) -> pd.Series:
+        values = series.abs() if absolute else series.copy()
+        valid = values.dropna()
+        if valid.empty or np.isclose(valid.max(), valid.min()):
+            score = pd.Series(0.0, index=series.index)
+        else:
+            score = (values - valid.min()) / (valid.max() - valid.min()) * 100
+        return 100 - score if invert else score
+
+    normalized["Dependencia importadora"] = minmax(summary["importacion_combustible_pct"])
+    normalized["Fricción logística"] = minmax(summary["lpi"], invert=True)
+    normalized["Presión inflacionaria"] = minmax(summary["inflacion_pct"])
+    normalized["Exposición cambiaria"] = minmax(summary["variacion_cambiaria_pct"], absolute=True)
+    return raw, summary, normalized, source_status
+
+
+def create_regional_exposure_figure(normalized_df: pd.DataFrame):
+    metrics = [
+        "Dependencia importadora",
+        "Fricción logística",
+        "Presión inflacionaria",
+        "Exposición cambiaria",
+    ]
+    countries = normalized_df["pais"].tolist()
+    y = np.arange(len(metrics), dtype=float)
+    width = 0.23
+    colors = ["#2f78bd", "#ef8a47", "#53a567"]
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+    for index, country in enumerate(countries):
+        row = normalized_df[normalized_df["pais"] == country].iloc[0]
+        offset = (index - (len(countries) - 1) / 2) * width
+        ax.barh(y + offset, [row[metric] for metric in metrics], height=width * 0.9, label=country, color=colors[index])
+    ax.set_yticks(y)
+    ax.set_yticklabels(metrics)
+    ax.set_xlim(0, 105)
+    ax.set_xlabel("Exposición relativa dentro del bloque (0–100)")
+    ax.set_title("Comparación estructural regional normalizada")
+    ax.grid(axis="x", alpha=0.25)
+    ax.legend(frameon=False, ncol=3, loc="lower center", bbox_to_anchor=(0.5, -0.28))
+    fig.tight_layout()
+    return fig
+
+
+def load_regional_elasticity_data(source: Any) -> pd.DataFrame:
+    source_name = str(getattr(source, "name", "")).lower()
+    raw = pd.read_csv(source) if source_name.endswith(".csv") else pd.read_excel(source)
+    raw = normalize_columns(raw)
+    date_col = find_column(raw.columns, ["periodo", "fecha", "mes"])
+    country_col = find_column(raw.columns, ["pais", "country"])
+    fuel_col = find_column(raw.columns, ["precio_combustible", "combustible", "fuel_price"])
+    basket_col = find_column(raw.columns, ["indice_cba", "cba", "canasta_basica", "basket_index"])
+
+    data = raw[[date_col, country_col, fuel_col, basket_col]].rename(
+        columns={
+            date_col: "periodo",
+            country_col: "pais",
+            fuel_col: "precio_combustible",
+            basket_col: "indice_cba",
+        }
+    )
+    data["periodo"] = parse_dates_safely(data["periodo"], dayfirst=True).dt.to_period("M").dt.to_timestamp()
+    data["pais"] = data["pais"].astype(str).str.strip()
+    data["precio_combustible"] = to_numeric_series(data["precio_combustible"])
+    data["indice_cba"] = to_numeric_series(data["indice_cba"])
+    data = data.dropna().query("precio_combustible > 0 and indice_cba > 0")
+    data = data.groupby(["pais", "periodo"], as_index=False)[["precio_combustible", "indice_cba"]].mean()
+    valid_countries = data.groupby("pais").size()
+    valid_countries = valid_countries[valid_countries >= 24].index
+    data = data[data["pais"].isin(valid_countries)].sort_values(["pais", "periodo"]).reset_index(drop=True)
+    if data.empty:
+        raise ValueError("Se requieren al menos 24 meses positivos por país para estimar elasticidades.")
+    return data
+
+
+def analyze_regional_elasticity(data: pd.DataFrame) -> pd.DataFrame:
+    results: list[dict[str, Any]] = []
+    for country, group in data.groupby("pais"):
+        group = group.sort_values("periodo").copy()
+        group["combustible_log_var"] = np.log(group["precio_combustible"]).diff()
+        group["cba_log_var"] = np.log(group["indice_cba"]).diff()
+        for lag in [0, 1, 3, 6]:
+            pair = pd.DataFrame(
+                {
+                    "x": group["combustible_log_var"].shift(lag),
+                    "y": group["cba_log_var"],
+                }
+            ).dropna()
+            if len(pair) < 18 or np.isclose(pair["x"].var(), 0) or np.isclose(pair["y"].var(), 0):
+                continue
+            elasticity = float(np.cov(pair["x"], pair["y"], ddof=1)[0, 1] / pair["x"].var(ddof=1))
+            correlation, p_value = pearsonr(pair["x"], pair["y"])
+            results.append(
+                {
+                    "pais": country,
+                    "rezago_meses": lag,
+                    "elasticidad_combustible_cba": elasticity,
+                    "correlacion": float(correlation),
+                    "p_valor": float(p_value),
+                    "observaciones": len(pair),
+                }
+            )
+    result = pd.DataFrame(results)
+    if result.empty:
+        raise ValueError("Las series no tienen variación suficiente para estimar elasticidades.")
+    result["rezago_destacado"] = False
+    for country, indexes in result.groupby("pais").groups.items():
+        best_index = result.loc[list(indexes), "correlacion"].abs().idxmax()
+        result.loc[best_index, "rezago_destacado"] = True
+    return result
+
+
+def create_regional_elasticity_figure(elasticity_df: pd.DataFrame):
+    countries = elasticity_df["pais"].drop_duplicates().tolist()
+    lags = [0, 1, 3, 6]
+    x = np.arange(len(lags), dtype=float)
+    width = min(0.24, 0.72 / max(1, len(countries)))
+    colors = ["#2f78bd", "#ef8a47", "#53a567", "#9b6cc2"]
+    fig, ax = plt.subplots(figsize=(10.5, 5.0))
+    for index, country in enumerate(countries):
+        country_data = elasticity_df[elasticity_df["pais"] == country].set_index("rezago_meses")
+        values = [country_data["elasticidad_combustible_cba"].get(lag, np.nan) for lag in lags]
+        offset = (index - (len(countries) - 1) / 2) * width
+        ax.bar(x + offset, values, width=width * 0.9, label=country, color=colors[index % len(colors)])
+    ax.axhline(0, color="#667085", linewidth=0.9)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(lag) for lag in lags])
+    ax.set_xlabel("Rezago del combustible (meses)")
+    ax.set_ylabel("Elasticidad de variaciones mensuales")
+    ax.set_title("Elasticidad combustible–CBA por país y rezago")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
 def regularize_series(series: pd.Series) -> pd.Series:
     regular = series.sort_index().asfreq("MS")
     if regular.notna().sum() < 12:
@@ -941,6 +1202,72 @@ def main() -> None:
         except (ValueError, OSError, KeyError, IndexError) as exc:
             st.error(f"No se pudo construir el análisis de IPC sectorial: {exc}")
 
+    regional_raw_df = pd.DataFrame()
+    regional_summary_df = pd.DataFrame()
+    regional_normalized_df = pd.DataFrame()
+    st.divider()
+    st.header("Comparación regional estructural")
+    st.caption(
+        "Benchmark Panamá–Costa Rica–República Dominicana con indicadores comparables. "
+        "Las escalas normalizadas describen exposición relativa dentro de este bloque; no son un ranking mundial."
+    )
+    try:
+        with st.spinner("Consultando indicadores regionales oficiales..."):
+            regional_raw_df, regional_summary_df, regional_normalized_df, regional_source_status = (
+                load_regional_benchmark()
+            )
+
+        regional_col1, regional_col2 = st.columns([1.25, 1])
+        with regional_col1:
+            st.pyplot(create_regional_exposure_figure(regional_normalized_df), clear_figure=True)
+        with regional_col2:
+            regional_display = regional_summary_df[
+                [
+                    "pais",
+                    "lpi",
+                    "lpi_anio",
+                    "importacion_combustible_pct",
+                    "importacion_combustible_pct_anio",
+                    "inflacion_pct",
+                    "inflacion_pct_anio",
+                    "variacion_cambiaria_pct",
+                    "variacion_cambiaria_anio",
+                ]
+            ].rename(
+                columns={
+                    "pais": "País",
+                    "lpi": "LPI",
+                    "lpi_anio": "Año LPI",
+                    "importacion_combustible_pct": "Combustible / importaciones (%)",
+                    "importacion_combustible_pct_anio": "Año importaciones",
+                    "inflacion_pct": "Inflación general (%)",
+                    "inflacion_pct_anio": "Año inflación",
+                    "variacion_cambiaria_pct": "Variación cambiaria (%)",
+                    "variacion_cambiaria_anio": "Año cambiario",
+                }
+            )
+            numeric_columns = [
+                "LPI",
+                "Combustible / importaciones (%)",
+                "Inflación general (%)",
+                "Variación cambiaria (%)",
+            ]
+            regional_display[numeric_columns] = regional_display[numeric_columns].round(2)
+            st.dataframe(regional_display, width="stretch", hide_index=True)
+
+        st.info(
+            "Lectura: un valor alto en la escala normalizada indica mayor exposición dentro de los tres países. "
+            "La fricción logística invierte el LPI: menor desempeño logístico equivale a mayor fricción. "
+            "La exposición cambiaria usa la magnitud de la variación anual de la moneda frente al dólar."
+        )
+        st.caption(
+            f"Fuente: [World Development Indicators – Banco Mundial]({WORLD_BANK_DATA_URL}). "
+            f"Modo de consulta: {regional_source_status}. Inflación general se usa como proxy macroeconómico y no sustituye "
+            "una serie armonizada de inflación alimentaria."
+        )
+    except (ValueError, OSError, KeyError, IndexError, requests.RequestException) as exc:
+        st.error(f"No se pudo construir la comparación regional: {exc}")
+
     tab1, tab2, tab3 = st.tabs(["Serie mensual", "Histórico y pronóstico", "Control de hojas"])
     with tab1:
         st.dataframe(monthly_df, width="stretch")
@@ -963,6 +1290,12 @@ def main() -> None:
         export_sheets["resumen_rezagos_ipc"] = sectoral_summary_df
     if not sectoral_ccf_df.empty:
         export_sheets["ccf_ipc"] = sectoral_ccf_df
+    if not regional_raw_df.empty:
+        export_sheets["regional_datos_bm"] = regional_raw_df
+    if not regional_summary_df.empty:
+        export_sheets["regional_resumen"] = regional_summary_df
+    if not regional_normalized_df.empty:
+        export_sheets["regional_normalizado"] = regional_normalized_df
     excel_bytes = dataframe_download_bytes(export_sheets)
     st.download_button("Descargar resultados en Excel", excel_bytes, DEFAULT_OUTPUT_NAME, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
