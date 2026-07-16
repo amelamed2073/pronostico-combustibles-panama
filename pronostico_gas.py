@@ -29,6 +29,7 @@ DEFAULT_OUTPUT_NAME = "pronostico_combustibles_panama_web.xlsx"
 IPC_SOURCE_URL = "https://www.inec.gob.pa/publicaciones/Default3.aspx?ID_CATEGORIA=4&ID_PUBLICACION=1396&ID_SUBCATEGORIA=82"
 WORLD_BANK_API_BASE = "https://api.worldbank.org/v2"
 WORLD_BANK_DATA_URL = "https://data.worldbank.org"
+EIA_BRENT_SOURCE_URL = "https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?f=m&n=PET&s=RBRTE"
 PRICE_UNIT = "B/./litro"
 MIN_REASONABLE_PRICE = 0.05
 MAX_REASONABLE_PRICE = 10.0
@@ -800,6 +801,64 @@ def regularize_series(series: pd.Series) -> pd.Series:
     return regular.astype(float)
 
 
+@st.cache_data(ttl=86_400, show_spinner=False)
+def fetch_brent_monthly() -> pd.DataFrame:
+    """Descarga la tabla mensual oficial de Brent publicada por la EIA."""
+    response = requests.get(
+        EIA_BRENT_SOURCE_URL,
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; FuelForecastPrototype/3.0)"},
+    )
+    response.raise_for_status()
+    tables = pd.read_html(BytesIO(response.content))
+    raw = next(
+        (
+            table
+            for table in tables
+            if "Year" in table.columns and {"Jan", "Feb", "Mar", "Dec"}.issubset(table.columns)
+        ),
+        None,
+    )
+    if raw is None:
+        raise ValueError("La tabla mensual de Brent no tiene la estructura esperada.")
+
+    month_numbers = {
+        "Jan": 1,
+        "Feb": 2,
+        "Mar": 3,
+        "Apr": 4,
+        "May": 5,
+        "Jun": 6,
+        "Jul": 7,
+        "Aug": 8,
+        "Sep": 9,
+        "Oct": 10,
+        "Nov": 11,
+        "Dec": 12,
+    }
+    monthly = raw.melt(id_vars="Year", value_vars=list(month_numbers), var_name="mes", value_name="brent_usd_barril")
+    monthly["Year"] = pd.to_numeric(monthly["Year"], errors="coerce")
+    monthly["brent_usd_barril"] = pd.to_numeric(monthly["brent_usd_barril"], errors="coerce")
+    monthly["periodo"] = pd.to_datetime(
+        {
+            "year": monthly["Year"],
+            "month": monthly["mes"].map(month_numbers),
+            "day": 1,
+        },
+        errors="coerce",
+    )
+    monthly = (
+        monthly[["periodo", "brent_usd_barril"]]
+        .dropna()
+        .query("brent_usd_barril > 0")
+        .sort_values("periodo")
+        .reset_index(drop=True)
+    )
+    if len(monthly) < 36:
+        raise ValueError("La serie mensual de Brent tiene menos de 36 observaciones.")
+    return monthly
+
+
 def fit_ets(train: pd.Series, seasonal: bool):
     return ExponentialSmoothing(
         train,
@@ -820,7 +879,7 @@ def naive_forecast(train: pd.Series, horizon: int, seasonal: bool) -> pd.Series:
     return pd.Series(values, index=index, dtype=float)
 
 
-def forecast_series(series: pd.Series, horizon: int) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any]]:
+def forecast_baseline(series: pd.Series, horizon: int) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any]]:
     regular = regularize_series(series)
     holdout = min(12, max(3, len(regular) // 5))
     train, test = regular.iloc[:-holdout], regular.iloc[-holdout:]
@@ -872,7 +931,173 @@ def forecast_series(series: pd.Series, horizon: int) -> tuple[pd.Series, pd.Seri
     return forecast, lower, upper, metrics
 
 
-def build_forecast_output(monthly_df: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+def project_external_series(series: pd.Series, end_period: pd.Timestamp) -> pd.Series:
+    """Extiende una variable externa hasta el mes requerido usando la misma selección temporal base."""
+    regular = regularize_series(series)
+    end_period = pd.Timestamp(end_period).to_period("M").to_timestamp()
+    if regular.index[-1] >= end_period:
+        return regular.loc[:end_period]
+
+    missing_horizon = len(pd.date_range(regular.index[-1] + pd.offsets.MonthBegin(1), end_period, freq="MS"))
+    projected, _, _, _ = forecast_baseline(regular, missing_horizon)
+    return pd.concat([regular, projected]).sort_index()
+
+
+def forecast_dynamic_with_brent(
+    series: pd.Series,
+    brent_series: pd.Series,
+    horizon: int,
+    holdout: int,
+) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any]]:
+    """Modelo dinámico en diferencias con un rezago autorregresivo y variación del Brent."""
+    target = regularize_series(series)
+    brent = regularize_series(brent_series)
+    aligned_brent = brent.reindex(target.index).interpolate(method="time").ffill().bfill()
+    if aligned_brent.isna().any() or len(target) < max(36, holdout + 24):
+        raise ValueError("No hay suficiente período común entre Brent y el combustible.")
+
+    frame = pd.DataFrame({"nivel": target, "brent": aligned_brent})
+    frame["variacion"] = frame["nivel"].diff()
+    frame["variacion_rezagada"] = frame["variacion"].shift(1)
+    frame["variacion_log_brent"] = np.log(frame["brent"]).diff()
+    train_end = target.index[-holdout - 1]
+    test_index = target.index[-holdout:]
+    candidates: list[dict[str, Any]] = []
+
+    for lag in [0, 1, 2, 3]:
+        driver_col = f"brent_rezago_{lag}"
+        frame[driver_col] = frame["variacion_log_brent"].shift(lag)
+        train_rows = frame.loc[:train_end, ["variacion", "variacion_rezagada", driver_col]].dropna()
+        if len(train_rows) < 24:
+            continue
+        design = np.column_stack(
+            [
+                np.ones(len(train_rows)),
+                train_rows["variacion_rezagada"].to_numpy(),
+                train_rows[driver_col].to_numpy(),
+            ]
+        )
+        coefficients = np.linalg.lstsq(design, train_rows["variacion"].to_numpy(), rcond=None)[0]
+        previous_level = float(target.loc[train_end])
+        previous_change = float(frame.loc[train_end, "variacion"])
+        validation_predictions: list[float] = []
+        valid_candidate = True
+        for period in test_index:
+            driver_value = frame.loc[period, driver_col]
+            if pd.isna(driver_value):
+                valid_candidate = False
+                break
+            predicted_change = float(
+                coefficients[0] + coefficients[1] * previous_change + coefficients[2] * driver_value
+            )
+            previous_level = max(MIN_REASONABLE_PRICE, previous_level + predicted_change)
+            validation_predictions.append(previous_level)
+            previous_change = predicted_change
+        if not valid_candidate:
+            continue
+        mae = float(np.mean(np.abs(target.loc[test_index].to_numpy() - np.asarray(validation_predictions))))
+        candidates.append({"rezago": lag, "mae": mae})
+
+    if not candidates:
+        raise ValueError("No se pudo validar ningún rezago de Brent.")
+    best = min(candidates, key=lambda item: item["mae"])
+    selected_lag = int(best["rezago"])
+    selected_col = f"brent_rezago_{selected_lag}"
+    final_rows = frame[["variacion", "variacion_rezagada", selected_col]].dropna()
+    final_design = np.column_stack(
+        [
+            np.ones(len(final_rows)),
+            final_rows["variacion_rezagada"].to_numpy(),
+            final_rows[selected_col].to_numpy(),
+        ]
+    )
+    coefficients = np.linalg.lstsq(final_design, final_rows["variacion"].to_numpy(), rcond=None)[0]
+    fitted_changes = final_design @ coefficients
+    residuals = final_rows["variacion"].to_numpy() - fitted_changes
+
+    future_index = pd.date_range(target.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    projected_brent = project_external_series(brent, future_index[-1])
+    driver = np.log(projected_brent).diff().shift(selected_lag)
+    previous_level = float(target.iloc[-1])
+    previous_change = float(frame["variacion"].dropna().iloc[-1])
+    forecast_values: list[float] = []
+    for period in future_index:
+        driver_value = driver.get(period, np.nan)
+        if pd.isna(driver_value):
+            raise ValueError("La proyección de Brent no cubre todo el horizonte solicitado.")
+        predicted_change = float(
+            coefficients[0] + coefficients[1] * previous_change + coefficients[2] * driver_value
+        )
+        previous_level = max(MIN_REASONABLE_PRICE, previous_level + predicted_change)
+        forecast_values.append(previous_level)
+        previous_change = predicted_change
+
+    forecast = pd.Series(forecast_values, index=future_index, dtype=float)
+    residual_sigma = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+    scale = np.sqrt(np.arange(1, horizon + 1))
+    lower = pd.Series(
+        np.maximum(MIN_REASONABLE_PRICE, forecast.to_numpy() - 1.96 * residual_sigma * scale),
+        index=future_index,
+    )
+    upper = pd.Series(forecast.to_numpy() + 1.96 * residual_sigma * scale, index=future_index)
+    metrics = {
+        "mae_externo": float(best["mae"]),
+        "rezago_brent": selected_lag,
+        "coeficiente_brent": float(coefficients[2]),
+        "impacto_brent_10_pct": float(coefficients[2] * np.log(1.10)),
+    }
+    return forecast, lower, upper, metrics
+
+
+def forecast_series(
+    series: pd.Series,
+    horizon: int,
+    brent_series: Optional[pd.Series] = None,
+) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any]]:
+    baseline_forecast, baseline_lower, baseline_upper, metrics = forecast_baseline(series, horizon)
+    metrics.update(
+        {
+            "modelo_historico": metrics["modelo"],
+            "mae_historico": metrics["mae_validacion"],
+            "mae_externo": np.nan,
+            "mejora_mae_brent_pct": np.nan,
+            "rezago_brent": np.nan,
+            "coeficiente_brent": np.nan,
+            "impacto_brent_10_pct": np.nan,
+            "modelo_ganador": "Histórico",
+        }
+    )
+    if brent_series is None or brent_series.empty:
+        return baseline_forecast, baseline_lower, baseline_upper, metrics
+
+    try:
+        external_forecast, external_lower, external_upper, external_metrics = forecast_dynamic_with_brent(
+            series,
+            brent_series,
+            horizon,
+            int(metrics["meses_validacion"]),
+        )
+    except (ValueError, np.linalg.LinAlgError):
+        return baseline_forecast, baseline_lower, baseline_upper, metrics
+
+    external_mae = float(external_metrics["mae_externo"])
+    baseline_mae = float(metrics["mae_historico"])
+    improvement = (baseline_mae - external_mae) / baseline_mae * 100 if baseline_mae > 0 else 0.0
+    metrics.update(external_metrics)
+    metrics["mejora_mae_brent_pct"] = improvement
+    if external_mae < baseline_mae:
+        metrics["modelo"] = f"Dinámico con Brent (rezago {int(external_metrics['rezago_brent'])})"
+        metrics["mae_validacion"] = external_mae
+        metrics["modelo_ganador"] = "Brent"
+        return external_forecast, external_lower, external_upper, metrics
+    return baseline_forecast, baseline_lower, baseline_upper, metrics
+
+
+def build_forecast_output(
+    monthly_df: pd.DataFrame,
+    horizon: int,
+    brent_series: Optional[pd.Series] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     last_period = monthly_df["periodo"].max()
     future_periods = pd.date_range(last_period + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
     output = monthly_df.copy()
@@ -886,7 +1111,7 @@ def build_forecast_output(monthly_df: pd.DataFrame, horizon: int) -> tuple[pd.Da
             continue
         series = pd.Series(monthly_df[col].values, index=pd.DatetimeIndex(monthly_df["periodo"]), name=col)
         try:
-            pred, lower, upper, metrics = forecast_series(series, horizon)
+            pred, lower, upper, metrics = forecast_series(series, horizon, brent_series)
         except ValueError as exc:
             errors.append(f"{FUEL_NAMES[col]}: {exc}")
             continue
@@ -901,6 +1126,23 @@ def build_forecast_output(monthly_df: pd.DataFrame, horizon: int) -> tuple[pd.Da
             "promedio_historico": round(metrics["promedio"], 4),
             "tendencia_reciente_ultimos_4_meses": round(metrics["tendencia_reciente"], 4),
             "mae_validacion": round(metrics["mae_validacion"], 4),
+            "modelo_historico": metrics["modelo_historico"],
+            "mae_historico": round(metrics["mae_historico"], 4),
+            "mae_con_brent": round(metrics["mae_externo"], 4) if pd.notna(metrics["mae_externo"]) else np.nan,
+            "mejora_mae_brent_pct": (
+                round(metrics["mejora_mae_brent_pct"], 2)
+                if pd.notna(metrics["mejora_mae_brent_pct"])
+                else np.nan
+            ),
+            "rezago_brent_meses": (
+                int(metrics["rezago_brent"]) if pd.notna(metrics["rezago_brent"]) else np.nan
+            ),
+            "impacto_brent_10_pct": (
+                round(metrics["impacto_brent_10_pct"], 4)
+                if pd.notna(metrics["impacto_brent_10_pct"])
+                else np.nan
+            ),
+            "modelo_ganador": metrics["modelo_ganador"],
             "meses_validacion": metrics["meses_validacion"],
             "horizonte_meses": horizon,
             "direccion_esperada": "alza" if pred.iloc[-1] > metrics["ultimo_valor"] else "baja" if pred.iloc[-1] < metrics["ultimo_valor"] else "estable",
@@ -949,6 +1191,50 @@ def create_forecast_figure(combined_df: pd.DataFrame, horizon: int):
         if lower_col in forecast and upper_col in forecast:
             ax.fill_between(forecast["periodo"], forecast[lower_col], forecast[upper_col], color=line.get_color(), alpha=0.12)
     ax.set(title=f"Pronóstico con intervalo aproximado del 95 % ({horizon} meses)", xlabel="Periodo", ylabel=f"Precio ({PRICE_UNIT})")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    ax.tick_params(axis="x", rotation=20)
+    fig.tight_layout()
+    return fig
+
+
+def build_brent_projection(brent_df: pd.DataFrame, end_period: pd.Timestamp) -> pd.DataFrame:
+    observed = pd.Series(
+        brent_df["brent_usd_barril"].to_numpy(),
+        index=pd.DatetimeIndex(brent_df["periodo"]),
+        dtype=float,
+    )
+    extended = project_external_series(observed, end_period)
+    result = extended.rename("brent_usd_barril").rename_axis("periodo").reset_index()
+    result["tipo_registro"] = np.where(
+        result["periodo"] <= observed.index.max(),
+        "observado",
+        "proyeccion_auxiliar",
+    )
+    return result
+
+
+def create_brent_phase3_figure(brent_projection_df: pd.DataFrame, history_start: pd.Timestamp):
+    display = brent_projection_df[brent_projection_df["periodo"] >= history_start].copy()
+    observed = display[display["tipo_registro"] == "observado"]
+    projected = display[display["tipo_registro"] == "proyeccion_auxiliar"]
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+    ax.plot(observed["periodo"], observed["brent_usd_barril"], linewidth=2, label="Brent observado")
+    if not projected.empty:
+        bridge = pd.concat([observed.tail(1), projected], ignore_index=True)
+        ax.plot(
+            bridge["periodo"],
+            bridge["brent_usd_barril"],
+            linestyle="--",
+            linewidth=2,
+            label="Proyección auxiliar de Brent",
+        )
+        ax.axvspan(projected["periodo"].min(), projected["periodo"].max(), alpha=0.08)
+    ax.set(
+        title="Brent utilizado como variable externa",
+        xlabel="Periodo",
+        ylabel="USD por barril",
+    )
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
     ax.tick_params(axis="x", rotation=20)
@@ -1089,9 +1375,25 @@ def main() -> None:
         st.warning("Carga los Excel o colócalos en la misma carpeta del programa.")
         return
 
+    brent_monthly_df = pd.DataFrame()
+    brent_projection_df = pd.DataFrame()
+    brent_series: Optional[pd.Series] = None
+    phase3_error: Optional[str] = None
+    try:
+        with st.spinner("Consultando Brent para la Fase 3..."):
+            brent_monthly_df = fetch_brent_monthly()
+        brent_series = pd.Series(
+            brent_monthly_df["brent_usd_barril"].to_numpy(),
+            index=pd.DatetimeIndex(brent_monthly_df["periodo"]),
+            name="brent_usd_barril",
+            dtype=float,
+        )
+    except (requests.RequestException, ValueError, OSError, pd.errors.ParserError) as exc:
+        phase3_error = str(exc)
+
     try:
         monthly_df, sheet_log = load_fuel_data(input_sources)
-        combined_df, summary_df = build_forecast_output(monthly_df, selected_horizon)
+        combined_df, summary_df = build_forecast_output(monthly_df, selected_horizon, brent_series)
     except (ValueError, OSError, KeyError) as exc:
         st.error(f"Error al procesar los archivos: {exc}")
         return
@@ -1110,6 +1412,75 @@ def main() -> None:
         render_live_prices_box()
         st.subheader("Pronóstico final e intervalo aproximado")
         render_forecast_cards_final(summary_df, selected_horizon)
+
+    st.divider()
+    st.header("Fase 3: pronóstico con variable externa")
+    st.caption(
+        "Compara el mejor modelo histórico con una regresión dinámica que incorpora la variación mensual del Brent. "
+        "La validación utiliza el mismo bloque temporal final y selecciona automáticamente el menor MAE."
+    )
+    if brent_series is None or brent_monthly_df.empty:
+        st.warning(
+            "No se pudo consultar Brent en línea; el pronóstico continúa con los modelos históricos. "
+            f"Detalle: {phase3_error or 'fuente no disponible'}"
+        )
+    else:
+        try:
+            forecast_end = monthly_df["periodo"].max() + pd.offsets.MonthBegin(selected_horizon)
+            brent_projection_df = build_brent_projection(brent_monthly_df, forecast_end)
+            phase3_col1, phase3_col2 = st.columns([1.25, 1])
+            with phase3_col1:
+                history_start = max(
+                    pd.Timestamp("2015-01-01"),
+                    pd.Timestamp(monthly_df["periodo"].min()),
+                )
+                st.pyplot(
+                    create_brent_phase3_figure(brent_projection_df, history_start),
+                    clear_figure=True,
+                )
+            with phase3_col2:
+                latest_brent = brent_monthly_df.sort_values("periodo").iloc[-1]
+                st.metric(
+                    "Último promedio mensual de Brent",
+                    f"US${latest_brent['brent_usd_barril']:.2f}/barril",
+                    help=f"Último mes completo disponible: {latest_brent['periodo']:%Y-%m}",
+                )
+                phase3_display = summary_df[
+                    [
+                        "serie",
+                        "mae_historico",
+                        "mae_con_brent",
+                        "mejora_mae_brent_pct",
+                        "rezago_brent_meses",
+                        "modelo_ganador",
+                    ]
+                ].copy()
+                phase3_display["serie"] = phase3_display["serie"].map(FUEL_NAMES)
+                phase3_display = phase3_display.rename(
+                    columns={
+                        "serie": "Combustible",
+                        "mae_historico": "MAE histórico",
+                        "mae_con_brent": "MAE con Brent",
+                        "mejora_mae_brent_pct": "Mejora MAE (%)",
+                        "rezago_brent_meses": "Rezago Brent",
+                        "modelo_ganador": "Modelo ganador",
+                    }
+                )
+                st.dataframe(phase3_display, width="stretch", hide_index=True)
+
+            winners = int((summary_df["modelo_ganador"] == "Brent").sum())
+            st.info(
+                f"Resultado de selección: el modelo con Brent ganó para {winners} de "
+                f"{len(summary_df)} combustibles. Cuando no reduce el MAE, la aplicación conserva el modelo histórico. "
+                "El rezago indica cuántos meses tarda la variación del Brent en aportar señal predictiva."
+            )
+            st.caption(
+                f"Fuente y descarga mensual automatizada: [U.S. Energy Information Administration]({EIA_BRENT_SOURCE_URL}). "
+                "Para meses futuros, Brent se extiende con un modelo auxiliar validado; no representa una cotización futura de mercado."
+            )
+        except (ValueError, OSError, KeyError, IndexError) as exc:
+            phase3_error = str(exc)
+            st.warning(f"No se pudo completar la comparación con Brent: {exc}")
 
     sectoral_ipc_df = pd.DataFrame()
     sectoral_merged_df = pd.DataFrame()
@@ -1296,6 +1667,22 @@ def main() -> None:
         export_sheets["regional_resumen"] = regional_summary_df
     if not regional_normalized_df.empty:
         export_sheets["regional_normalizado"] = regional_normalized_df
+    if not brent_monthly_df.empty:
+        export_sheets["brent_mensual"] = brent_monthly_df
+    if not brent_projection_df.empty:
+        export_sheets["brent_y_proyeccion"] = brent_projection_df
+    phase3_columns = [
+        "serie",
+        "modelo_historico",
+        "mae_historico",
+        "mae_con_brent",
+        "mejora_mae_brent_pct",
+        "rezago_brent_meses",
+        "impacto_brent_10_pct",
+        "modelo_ganador",
+    ]
+    if all(column in summary_df.columns for column in phase3_columns):
+        export_sheets["comparacion_modelos_fase3"] = summary_df[phase3_columns]
     excel_bytes = dataframe_download_bytes(export_sheets)
     st.download_button("Descargar resultados en Excel", excel_bytes, DEFAULT_OUTPUT_NAME, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
