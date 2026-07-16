@@ -1360,7 +1360,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Configuración")
-        selected_horizon = st.slider("Meses a pronosticar", 3, 18, 6)
+        selected_horizon = st.slider("Meses a pronosticar", 3, 18, 12)
         use_uploaded = st.toggle("Usar archivos cargados", value=False)
         uploaded_files = st.file_uploader("Cargar archivos Excel", type=["xlsx"], accept_multiple_files=True)
         uploaded_ipc_sectoral = st.file_uploader(
