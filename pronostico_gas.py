@@ -1414,7 +1414,7 @@ def main() -> None:
         render_forecast_cards_final(summary_df, selected_horizon)
 
     st.divider()
-    st.header("Fase 3: pronóstico con variable externa")
+    st.header("Pronóstico con variable externa")
     st.caption(
         "Compara el mejor modelo histórico con una regresión dinámica que incorpora la variación mensual del Brent. "
         "La validación utiliza el mismo bloque temporal final y selecciona automáticamente el menor MAE."
