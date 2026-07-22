@@ -74,6 +74,11 @@ REGIONAL_COUNTRIES = {
     "CRI": "Costa Rica",
     "DOM": "República Dominicana",
 }
+REGIONAL_CURRENCY_LABELS = {
+    "PAN": "Balboa/USD",
+    "CRI": "Colón/USD",
+    "DOM": "Peso dominicano/USD",
+}
 REGIONAL_INDICATORS = {
     "LP.LPI.OVRL.XQ": "Índice de desempeño logístico (1–5)",
     "TM.VAL.FUEL.ZS.UN": "Importaciones de combustibles (% de mercancías)",
@@ -789,6 +794,13 @@ def load_regional_benchmark() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
                 row[f"{prefix}_anio"] = int(latest["anio"].iloc[0])
 
         fx = country_data[country_data["indicador"] == "PA.NUS.FCRF"].sort_values("anio").tail(2)
+        latest_fx = fx.tail(1)
+        if latest_fx.empty:
+            row["tipo_cambio_oficial"] = np.nan
+            row["tipo_cambio_anio"] = np.nan
+        else:
+            row["tipo_cambio_oficial"] = float(latest_fx["valor"].iloc[0])
+            row["tipo_cambio_anio"] = int(latest_fx["anio"].iloc[0])
         if len(fx) == 2 and float(fx["valor"].iloc[0]) != 0:
             row["variacion_cambiaria_pct"] = (
                 float(fx["valor"].iloc[1]) / float(fx["valor"].iloc[0]) - 1
@@ -815,6 +827,10 @@ def load_regional_benchmark() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
     normalized["Fricción logística"] = minmax(summary["lpi"], invert=True)
     normalized["Presión inflacionaria"] = minmax(summary["inflacion_pct"])
     normalized["Exposición cambiaria"] = minmax(summary["variacion_cambiaria_pct"], absolute=True)
+    normalized["Presión fletes/logística"] = (
+        normalized["Dependencia importadora"] + normalized["Fricción logística"]
+    ) / 2
+    summary["presion_fletes_logistica_score"] = normalized["Presión fletes/logística"].to_numpy()
     return raw, summary, normalized, source_status
 
 
@@ -841,6 +857,61 @@ def create_regional_exposure_figure(normalized_df: pd.DataFrame):
     ax.set_title("Comparación estructural regional normalizada")
     ax.grid(axis="x", alpha=0.25)
     ax.legend(frameon=False, ncol=3, loc="lower center", bbox_to_anchor=(0.5, -0.28))
+    fig.tight_layout()
+    return fig
+
+
+def create_exchange_rate_figure(summary_df: pd.DataFrame):
+    display = summary_df.dropna(subset=["variacion_cambiaria_pct"]).copy()
+    colors = ["#2f78bd", "#ef8a47", "#53a567"]
+    fig, ax = plt.subplots(figsize=(10.0, 4.6))
+    ax.bar(
+        display["pais"],
+        display["variacion_cambiaria_pct"],
+        color=colors[: len(display)],
+        width=0.58,
+    )
+    ax.axhline(0, color="#667085", linewidth=1.0)
+    ax.set_ylabel("Variación anual frente al USD (%)")
+    ax.set_title("Tipo de cambio: cambio anual de la moneda local por USD")
+    ax.grid(axis="y", alpha=0.25)
+    for index, row in display.reset_index(drop=True).iterrows():
+        value = float(row["variacion_cambiaria_pct"])
+        offset = 0.35 if value >= 0 else -0.55
+        va = "bottom" if value >= 0 else "top"
+        ax.text(index, value + offset, f"{value:+.2f}%", ha="center", va=va, fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def create_logistics_freight_figure(summary_df: pd.DataFrame):
+    display = summary_df.copy()
+    colors = ["#2f78bd", "#ef8a47", "#53a567"]
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.6))
+    axes[0].bar(
+        display["pais"],
+        display["lpi"],
+        color=colors[: len(display)],
+        width=0.58,
+    )
+    axes[0].set_title("Desempeño logístico")
+    axes[0].set_ylabel("LPI (1-5)")
+    axes[0].set_ylim(0, max(3.8, float(display["lpi"].max()) + 0.5))
+    axes[0].grid(axis="y", alpha=0.25)
+
+    axes[1].bar(
+        display["pais"],
+        display["importacion_combustible_pct"],
+        color=colors[: len(display)],
+        width=0.58,
+    )
+    axes[1].set_title("Dependencia importadora de combustibles")
+    axes[1].set_ylabel("% de mercancías")
+    axes[1].grid(axis="y", alpha=0.25)
+
+    for axis in axes:
+        axis.tick_params(axis="x", rotation=0)
+    fig.suptitle("Fletes y logística: presión estructural del abastecimiento", y=1.02)
     fig.tight_layout()
     return fig
 
@@ -1835,6 +1906,108 @@ def main() -> None:
             "Lectura: un valor alto en la escala normalizada indica mayor exposición dentro de los tres países. "
             "La fricción logística invierte el LPI: menor desempeño logístico equivale a mayor fricción. "
             "La exposición cambiaria usa la magnitud de la variación anual de la moneda frente al dólar."
+        )
+
+        st.subheader("Tipo de cambio")
+        st.caption(
+            "Se muestra el tipo de cambio oficial más reciente frente al dólar y su variación anual. "
+            "Una mayor variación sugiere más riesgo de traspaso cambiario hacia combustibles importados."
+        )
+        fx_metric_cols = st.columns(len(regional_summary_df))
+        for column, (_, row) in zip(fx_metric_cols, regional_summary_df.iterrows()):
+            value = row["tipo_cambio_oficial"]
+            delta = row["variacion_cambiaria_pct"]
+            year = row["tipo_cambio_anio"]
+            delta_year = row["variacion_cambiaria_anio"]
+            value_text = f"{value:.2f}" if pd.notna(value) else "s/d"
+            if pd.notna(delta):
+                delta_text = f"{delta:+.2f}% anual"
+                help_text = (
+                    f"{REGIONAL_CURRENCY_LABELS[row['codigo_pais']]} en {int(year)}; "
+                    f"variación interanual calculada para {int(delta_year)}."
+                )
+            else:
+                delta_text = "sin variación comparable"
+                help_text = f"{REGIONAL_CURRENCY_LABELS[row['codigo_pais']]} en {int(year)}." if pd.notna(year) else None
+            column.metric(row["pais"], value_text, delta_text, help=help_text)
+            column.caption(REGIONAL_CURRENCY_LABELS[row["codigo_pais"]])
+
+        fx_col1, fx_col2 = st.columns([1.15, 1])
+        with fx_col1:
+            st.pyplot(create_exchange_rate_figure(regional_summary_df), clear_figure=True)
+        with fx_col2:
+            fx_display = regional_summary_df[
+                [
+                    "pais",
+                    "tipo_cambio_oficial",
+                    "tipo_cambio_anio",
+                    "variacion_cambiaria_pct",
+                    "variacion_cambiaria_anio",
+                ]
+            ].rename(
+                columns={
+                    "pais": "País",
+                    "tipo_cambio_oficial": "Tipo de cambio oficial",
+                    "tipo_cambio_anio": "Año tipo de cambio",
+                    "variacion_cambiaria_pct": "Variación anual (%)",
+                    "variacion_cambiaria_anio": "Año variación",
+                }
+            )
+            fx_display["Unidad"] = regional_summary_df["codigo_pais"].map(REGIONAL_CURRENCY_LABELS)
+            fx_display[
+                ["Tipo de cambio oficial", "Variación anual (%)"]
+            ] = fx_display[["Tipo de cambio oficial", "Variación anual (%)"]].round(2)
+            st.dataframe(fx_display, width="stretch", hide_index=True)
+
+        highest_fx_country = regional_summary_df.iloc[
+            regional_summary_df["variacion_cambiaria_pct"].abs().fillna(-1).idxmax()
+        ]["pais"]
+        st.info(
+            f"Lectura: Panamá sirve como referencia estable alrededor de 1.00 por su dolarización operativa. "
+            f"Dentro de este bloque, {highest_fx_country} muestra la mayor variación cambiaria reciente frente al USD."
+        )
+
+        st.subheader("Fletes y logística")
+        st.caption(
+            "Se aproxima con dos señales estructurales oficiales: desempeño logístico (LPI) y dependencia "
+            "importadora de combustibles. Mayor dependencia y menor LPI implican más presión potencial de fletes."
+        )
+        logistics_col1, logistics_col2 = st.columns([1.15, 1])
+        with logistics_col1:
+            st.pyplot(create_logistics_freight_figure(regional_summary_df), clear_figure=True)
+        with logistics_col2:
+            logistics_display = regional_summary_df[
+                [
+                    "pais",
+                    "lpi",
+                    "lpi_anio",
+                    "importacion_combustible_pct",
+                    "importacion_combustible_pct_anio",
+                    "presion_fletes_logistica_score",
+                ]
+            ].rename(
+                columns={
+                    "pais": "País",
+                    "lpi": "LPI",
+                    "lpi_anio": "Año LPI",
+                    "importacion_combustible_pct": "Combustible / importaciones (%)",
+                    "importacion_combustible_pct_anio": "Año importaciones",
+                    "presion_fletes_logistica_score": "Presión fletes/logística (0-100)",
+                }
+            )
+            logistics_display[
+                ["LPI", "Combustible / importaciones (%)", "Presión fletes/logística (0-100)"]
+            ] = logistics_display[
+                ["LPI", "Combustible / importaciones (%)", "Presión fletes/logística (0-100)"]
+            ].round(2)
+            st.dataframe(logistics_display, width="stretch", hide_index=True)
+
+        highest_logistics_country = regional_summary_df.iloc[
+            regional_summary_df["presion_fletes_logistica_score"].fillna(-1).idxmax()
+        ]["pais"]
+        st.info(
+            f"Lectura: la presión de fletes y logística combina fricción logística y dependencia importadora. "
+            f"Dentro del bloque analizado, {highest_logistics_country} presenta la mayor exposición estructural."
         )
         st.caption(
             f"Fuente: [World Development Indicators – Banco Mundial]({WORLD_BANK_DATA_URL}). "
