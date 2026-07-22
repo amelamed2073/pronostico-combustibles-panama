@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from html import escape
 from io import BytesIO
+import os
 from pathlib import Path
 from typing import Any, Iterable, Optional
 import re
@@ -9,18 +9,26 @@ import sys
 import unicodedata
 import warnings
 
+PROJECT_DIR = Path(__file__).resolve().parent
+LOCAL_CACHE_DIR = PROJECT_DIR / ".cache"
+MPL_CACHE_DIR = LOCAL_CACHE_DIR / "matplotlib"
+LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(LOCAL_CACHE_DIR))
+os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from scipy.stats import pearsonr
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.stattools import coint, grangercausalitytests
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = PROJECT_DIR
 DEFAULT_INPUT_FILE_NAMES = [
     "Precio historico de la gasolina (2015-2026) (2).xlsx",
 ]
@@ -426,6 +434,102 @@ def _ols_predict(train: pd.DataFrame, test: pd.DataFrame, features: list[str]) -
     return test_x @ coefficients
 
 
+def run_granger_test(
+    pair: pd.DataFrame,
+    target_col: str,
+    driver_col: str,
+    max_lag: int = 6,
+) -> dict[str, Any]:
+    cleaned = pair[[target_col, driver_col]].dropna().copy()
+    cleaned = cleaned[np.isfinite(cleaned[target_col]) & np.isfinite(cleaned[driver_col])]
+    if len(cleaned) < max(24, (max_lag + 1) * 4):
+        return {
+            "mejor_rezago": np.nan,
+            "p_valor_min": np.nan,
+            "estadistico_f": np.nan,
+            "rezagos_significativos": 0,
+            "observaciones": len(cleaned),
+            "significativo_5_pct": False,
+        }
+
+    if np.isclose(cleaned[target_col].std(ddof=0), 0) or np.isclose(cleaned[driver_col].std(ddof=0), 0):
+        return {
+            "mejor_rezago": np.nan,
+            "p_valor_min": np.nan,
+            "estadistico_f": np.nan,
+            "rezagos_significativos": 0,
+            "observaciones": len(cleaned),
+            "significativo_5_pct": False,
+        }
+
+    granger_input = cleaned[[target_col, driver_col]].astype(float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = grangercausalitytests(granger_input, maxlag=max_lag, verbose=False)
+
+    lag_rows: list[dict[str, Any]] = []
+    for lag, lag_result in result.items():
+        f_stat, p_value, _, _ = lag_result[0]["ssr_ftest"]
+        lag_rows.append(
+            {
+                "lag": lag,
+                "f_stat": float(f_stat),
+                "p_value": float(p_value),
+            }
+        )
+
+    best = min(lag_rows, key=lambda row: row["p_value"])
+    significant_count = sum(row["p_value"] < 0.05 for row in lag_rows)
+    return {
+        "mejor_rezago": int(best["lag"]),
+        "p_valor_min": float(best["p_value"]),
+        "estadistico_f": float(best["f_stat"]),
+        "rezagos_significativos": int(significant_count),
+        "observaciones": len(cleaned),
+        "significativo_5_pct": bool(best["p_value"] < 0.05),
+    }
+
+
+def run_cointegration_test(
+    pair: pd.DataFrame,
+    left_col: str,
+    right_col: str,
+    max_lag: int = 6,
+) -> dict[str, Any]:
+    cleaned = pair[[left_col, right_col]].dropna().copy()
+    cleaned = cleaned[np.isfinite(cleaned[left_col]) & np.isfinite(cleaned[right_col])]
+    cleaned = cleaned[(cleaned[left_col] > 0) & (cleaned[right_col] > 0)]
+    if len(cleaned) < max(36, (max_lag + 1) * 6):
+        return {
+            "estadistico": np.nan,
+            "p_valor": np.nan,
+            "critico_5_pct": np.nan,
+            "cointegrada_5_pct": False,
+            "observaciones": len(cleaned),
+        }
+
+    left_log = np.log(cleaned[left_col].astype(float))
+    right_log = np.log(cleaned[right_col].astype(float))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        stat, p_value, critical_values = coint(
+            left_log,
+            right_log,
+            trend="c",
+            maxlag=max_lag,
+            autolag="aic",
+        )
+
+    critical_5 = float(critical_values[1]) if len(critical_values) >= 2 else np.nan
+    return {
+        "estadistico": float(stat),
+        "p_valor": float(p_value),
+        "critico_5_pct": critical_5,
+        "cointegrada_5_pct": bool(np.isfinite(stat) and np.isfinite(critical_5) and stat < critical_5),
+        "observaciones": len(cleaned),
+    }
+
+
 def analyze_sectoral_ipc(
     ipc_df: pd.DataFrame,
     monthly_fuel_df: pd.DataFrame,
@@ -452,6 +556,9 @@ def analyze_sectoral_ipc(
     for sector in sector_cols:
         target_col = f"{sector}_var_pct"
         base = merged[["periodo", "combustible_var_pct", target_col]].rename(columns={target_col: "objetivo"})
+        level_pair = merged[["periodo", fuel_col, sector]].rename(
+            columns={fuel_col: "combustible_nivel", sector: "ipc_nivel"}
+        )
 
         sector_ccf: list[dict[str, Any]] = []
         for lag in range(max_lag + 1):
@@ -480,6 +587,10 @@ def analyze_sectoral_ipc(
 
         valid_ccf = [row for row in sector_ccf if np.isfinite(row["correlacion"])]
         best_ccf = max(valid_ccf, key=lambda row: abs(row["correlacion"]))
+
+        granger_forward = run_granger_test(base, "objetivo", "combustible_var_pct", max_lag=min(6, max_lag))
+        granger_reverse = run_granger_test(base, "combustible_var_pct", "objetivo", max_lag=min(6, max_lag))
+        cointegration = run_cointegration_test(level_pair, "ipc_nivel", "combustible_nivel", max_lag=min(6, max_lag))
 
         model_data = base.copy()
         model_data["objetivo_lag_1"] = model_data["objetivo"].shift(1)
@@ -531,6 +642,42 @@ def analyze_sectoral_ipc(
                 "meses_prueba_final": final_holdout,
                 "periodo_inicio": merged["periodo"].min(),
                 "periodo_fin": merged["periodo"].max(),
+                "granger_combustible_ipc_rezago": granger_forward["mejor_rezago"],
+                "granger_combustible_ipc_p_valor": (
+                    round(granger_forward["p_valor_min"], 4)
+                    if np.isfinite(granger_forward["p_valor_min"])
+                    else np.nan
+                ),
+                "granger_combustible_ipc_f_stat": (
+                    round(granger_forward["estadistico_f"], 4)
+                    if np.isfinite(granger_forward["estadistico_f"])
+                    else np.nan
+                ),
+                "granger_combustible_ipc_significativo": granger_forward["significativo_5_pct"],
+                "granger_ipc_combustible_rezago": granger_reverse["mejor_rezago"],
+                "granger_ipc_combustible_p_valor": (
+                    round(granger_reverse["p_valor_min"], 4)
+                    if np.isfinite(granger_reverse["p_valor_min"])
+                    else np.nan
+                ),
+                "granger_ipc_combustible_significativo": granger_reverse["significativo_5_pct"],
+                "cointegracion_estadistico": (
+                    round(cointegration["estadistico"], 4)
+                    if np.isfinite(cointegration["estadistico"])
+                    else np.nan
+                ),
+                "cointegracion_p_valor": (
+                    round(cointegration["p_valor"], 4)
+                    if np.isfinite(cointegration["p_valor"])
+                    else np.nan
+                ),
+                "cointegracion_critico_5_pct": (
+                    round(cointegration["critico_5_pct"], 4)
+                    if np.isfinite(cointegration["critico_5_pct"])
+                    else np.nan
+                ),
+                "cointegracion_5_pct": cointegration["cointegrada_5_pct"],
+                "observaciones_cointegracion": cointegration["observaciones"],
             }
         )
 
@@ -1254,103 +1401,98 @@ def dataframe_download_bytes(df_map: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
+def build_local_reference_prices(monthly_df: pd.DataFrame) -> tuple[dict[str, float], dict[str, pd.Timestamp]]:
+    history = monthly_df.sort_values("periodo")
+    prices: dict[str, float] = {}
+    periods: dict[str, pd.Timestamp] = {}
+    for fuel_key in FUEL_NAMES:
+        if fuel_key not in history.columns:
+            continue
+        valid = history[["periodo", fuel_key]].dropna()
+        if valid.empty:
+            continue
+        latest = valid.iloc[-1]
+        prices[fuel_key] = float(latest[fuel_key])
+        periods[fuel_key] = pd.Timestamp(latest["periodo"])
+    return prices, periods
+
+
+def render_overview_metrics(monthly_df: pd.DataFrame, summary_df: pd.DataFrame, selected_horizon: int) -> None:
+    last_period = pd.Timestamp(monthly_df["periodo"].max())
+    winners = int((summary_df["modelo_ganador"] == "Brent").sum()) if "modelo_ganador" in summary_df else 0
+    cols = st.columns(4)
+    cols[0].metric("Último mes histórico", f"{last_period:%Y-%m}")
+    cols[1].metric("Horizonte activo", f"{selected_horizon} meses")
+    cols[2].metric("Combustibles modelados", f"{len(summary_df)}")
+    cols[3].metric("Modelos con Brent", f"{winners}")
+
+
+def render_validation_table(summary_df: pd.DataFrame) -> None:
+    validation_df = summary_df[
+        ["serie", "modelo", "mae_validacion", "meses_validacion", "direccion_esperada"]
+    ].copy()
+    validation_df["serie"] = validation_df["serie"].map(FUEL_NAMES)
+    validation_df["mae_validacion"] = validation_df["mae_validacion"].round(4)
+    validation_df["direccion_esperada"] = validation_df["direccion_esperada"].str.capitalize()
+    st.dataframe(
+        validation_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "serie": st.column_config.TextColumn("Combustible", width="small"),
+            "modelo": st.column_config.TextColumn("Modelo", width="medium"),
+            "mae_validacion": st.column_config.NumberColumn("MAE", format="%.4f", width="small"),
+            "meses_validacion": st.column_config.NumberColumn("Meses val.", format="%d", width="small"),
+            "direccion_esperada": st.column_config.TextColumn("Señal", width="small"),
+        },
+    )
+
+
 def render_forecast_cards_final(summary_df: pd.DataFrame, selected_horizon: int) -> None:
     forecast_col = f"pronostico_mes_{selected_horizon}"
     lower_col = f"lim_inf_mes_{selected_horizon}"
     upper_col = f"lim_sup_mes_{selected_horizon}"
-    cards = [
-        """
-        <style>
-        :root { color-scheme: light dark; }
-        html, body {
-            margin: 0;
-            padding: 0;
-            background: transparent;
-            color: #1f2937;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        }
-        .forecast-grid {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 12px;
-        }
-        .forecast-card {
-            border: 1px solid rgba(31, 41, 55, 0.22);
-            border-radius: 14px;
-            padding: 15px 18px;
-            background: rgba(255, 255, 255, 0.78);
-        }
-        .forecast-card-title {
-            color: #374151;
-            font-size: 0.95rem;
-            font-weight: 600;
-            margin-bottom: 10px;
-        }
-        .forecast-card-label {
-            color: #6b7280;
-            font-size: 0.78rem;
-            margin-top: 8px;
-        }
-        .forecast-card-value {
-            color: #111827;
-            font-size: 1.8rem;
-            font-weight: 700;
-            margin: 2px 0 7px;
-        }
-        .forecast-card-detail {
-            color: #4b5563;
-            font-size: 0.88rem;
-            font-weight: 500;
-        }
-        @media (prefers-color-scheme: dark) {
-            html, body { color: #f3f4f6; }
-            .forecast-card {
-                background: rgba(255, 255, 255, 0.07);
-                border-color: rgba(255, 255, 255, 0.22);
-            }
-            .forecast-card-title { color: #e5e7eb; }
-            .forecast-card-label { color: #9ca3af; }
-            .forecast-card-value { color: #ffffff; }
-            .forecast-card-detail { color: #d1d5db; }
-        }
-        </style>
-        <div class="forecast-grid">
-        """
-    ]
-    for _, row in summary_df.iterrows():
-        name = escape(FUEL_NAMES.get(str(row["serie"]), str(row["serie"])))
-        cards.append(
-            f"""
-            <div class="forecast-card">
-                <div class="forecast-card-title">{name}</div>
-                <div class="forecast-card-label">Precio pronosticado · mes {selected_horizon}</div>
-                <div class="forecast-card-value">{float(row[forecast_col]):.4f} {escape(PRICE_UNIT)}</div>
-                <div class="forecast-card-label">Intervalo aproximado del 95 %</div>
-                <div class="forecast-card-detail">
-                    {float(row[lower_col]):.4f}–{float(row[upper_col]):.4f} {escape(PRICE_UNIT)}
-                </div>
-                <div class="forecast-card-label">Tendencia central</div>
-                <div class="forecast-card-detail">{escape(str(row['direccion_esperada']).capitalize())}</div>
-            </div>
-            """
-        )
-    cards.append("</div>")
-    component_height = max(190, 190 * len(summary_df))
-    components.html("".join(cards), height=component_height, scrolling=False)
+    columns = st.columns(len(summary_df))
+    for column, (_, row) in zip(columns, summary_df.iterrows()):
+        name = FUEL_NAMES.get(str(row["serie"]), str(row["serie"]))
+        with column:
+            with st.container(border=True):
+                st.caption(f"Mes {selected_horizon}")
+                st.metric(name, f"{float(row[forecast_col]):.4f} {PRICE_UNIT}")
+                st.caption("Intervalo aproximado del 95 %")
+                st.write(f"{float(row[lower_col]):.4f}–{float(row[upper_col]):.4f} {PRICE_UNIT}")
+                st.caption("Tendencia central")
+                st.write(str(row["direccion_esperada"]).capitalize())
 
 
-def render_live_prices_box() -> None:
-    st.subheader("Precios vigentes en línea de Panamá")
+def render_live_prices_box(monthly_df: pd.DataFrame) -> None:
+    st.subheader("Precios de referencia en Panamá")
     with st.spinner("Consultando precios vigentes..."):
         prices, source_url = fetch_live_panama_prices()
+    reference_mode = "live"
+    source_text = ""
     if not prices:
-        st.info("No se pudieron validar precios vigentes en la fuente configurada.")
-        return
+        prices, local_periods = build_local_reference_prices(monthly_df)
+        if not prices:
+            st.info("No hay precios disponibles ni en línea ni en el historial local.")
+            return
+        reference_mode = "local"
+        unique_periods = sorted({period.strftime("%Y-%m") for period in local_periods.values()})
+        if len(unique_periods) == 1:
+            source_text = f"Respaldo local · último mes disponible: {unique_periods[0]}"
+        else:
+            period_by_fuel = ", ".join(
+                f"{FUEL_NAMES[key]} {local_periods[key]:%Y-%m}" for key in prices if key in local_periods
+            )
+            source_text = f"Respaldo local por serie: {period_by_fuel}"
+        st.info("No se pudieron validar precios vigentes en línea; se muestran los últimos valores del historial local.")
     cols = st.columns(len(prices))
     for column, (key, value) in zip(cols, prices.items()):
         column.metric(FUEL_NAMES[key], f"{value:.4f} {PRICE_UNIT}")
-    if source_url:
+    if source_url and reference_mode == "live":
         st.caption(f"Fuente: {source_url} · Consulta almacenada durante una hora")
+    elif source_text:
+        st.caption(source_text)
 
 
 def main() -> None:
@@ -1398,18 +1540,20 @@ def main() -> None:
         st.error(f"Error al procesar los archivos: {exc}")
         return
 
+    render_overview_metrics(monthly_df, summary_df, selected_horizon)
+
     top_col1, top_col2 = st.columns([1.3, 1])
     with top_col1:
         st.pyplot(create_historical_figure(combined_df), clear_figure=True)
     with top_col2:
         st.subheader("Validación del modelo")
-        st.dataframe(summary_df[["serie", "modelo", "mae_validacion", "meses_validacion", "direccion_esperada"]], width="stretch", hide_index=True)
+        render_validation_table(summary_df)
 
     bottom_col1, bottom_col2 = st.columns([1.3, 1])
     with bottom_col1:
         st.pyplot(create_forecast_figure(combined_df, selected_horizon), clear_figure=True)
     with bottom_col2:
-        render_live_prices_box()
+        render_live_prices_box(monthly_df)
         st.subheader("Pronóstico final e intervalo aproximado")
         render_forecast_cards_final(summary_df, selected_horizon)
 
@@ -1490,7 +1634,8 @@ def main() -> None:
     st.header("IPC sectorial: transmisión y rezagos")
     st.caption(
         "Compara variaciones mensuales del combustible con divisiones del IPC. "
-        "Los resultados muestran asociación temporal y capacidad predictiva; no demuestran causalidad."
+        "Los resultados muestran asociación temporal, precedencia tipo Granger y cointegración de largo plazo; "
+        "no demuestran causalidad estructural por sí solos."
     )
     sector_source: Any = uploaded_ipc_sectoral
     if sector_source is None:
@@ -1566,6 +1711,66 @@ def main() -> None:
                 f"El rezago predictivo elegido fue {int(selected_result['rezago_predictivo_meses'])} meses. "
                 f"{predictive_text}"
             )
+            st.subheader("Granger y cointegración")
+            causal_display = sectoral_summary_df[
+                [
+                    "sector_nombre",
+                    "granger_combustible_ipc_rezago",
+                    "granger_combustible_ipc_p_valor",
+                    "granger_ipc_combustible_rezago",
+                    "granger_ipc_combustible_p_valor",
+                    "cointegracion_p_valor",
+                    "cointegracion_5_pct",
+                ]
+            ].rename(
+                columns={
+                    "sector_nombre": "Componente IPC",
+                    "granger_combustible_ipc_rezago": "Rezago Granger comb.→IPC",
+                    "granger_combustible_ipc_p_valor": "p-valor comb.→IPC",
+                    "granger_ipc_combustible_rezago": "Rezago Granger IPC→comb.",
+                    "granger_ipc_combustible_p_valor": "p-valor IPC→comb.",
+                    "cointegracion_p_valor": "p-valor cointegración",
+                    "cointegracion_5_pct": "Cointegrada al 5%",
+                }
+            )
+            st.dataframe(causal_display, width="stretch", hide_index=True)
+
+            granger_forward_sig = bool(selected_result["granger_combustible_ipc_significativo"])
+            granger_reverse_sig = bool(selected_result["granger_ipc_combustible_significativo"])
+            coint_sig = bool(selected_result["cointegracion_5_pct"])
+            if granger_forward_sig:
+                granger_forward_text = (
+                    f"Sí hay evidencia de precedencia temporal tipo Granger desde el combustible hacia "
+                    f"{selected_result['sector_nombre']} con mejor rezago de "
+                    f"{int(selected_result['granger_combustible_ipc_rezago'])} meses."
+                )
+            else:
+                granger_forward_text = (
+                    f"No hay evidencia suficiente al 5 % de precedencia tipo Granger desde el combustible hacia "
+                    f"{selected_result['sector_nombre']}."
+                )
+
+            if granger_reverse_sig:
+                granger_reverse_text = (
+                    f"En sentido inverso, el IPC sectorial también muestra señal temporal sobre el combustible "
+                    f"con mejor rezago de {int(selected_result['granger_ipc_combustible_rezago'])} meses."
+                )
+            else:
+                granger_reverse_text = (
+                    "En sentido inverso no aparece evidencia fuerte al 5 % en la prueba de Granger."
+                )
+
+            if coint_sig:
+                coint_text = (
+                    f"Además, las series en niveles lucen cointegradas al 5 %, lo que sugiere una relación "
+                    f"de equilibrio de largo plazo."
+                )
+            else:
+                coint_text = (
+                    "No aparece cointegración al 5 % en niveles, así que la relación observada parece más "
+                    "de corto/mediano plazo que de equilibrio estable."
+                )
+            st.info(f"{granger_forward_text} {granger_reverse_text} {coint_text}")
             st.caption(
                 f"Período común: {selected_result['periodo_inicio']:%Y-%m} a "
                 f"{selected_result['periodo_fin']:%Y-%m}. Fuente del IPC: [INEC Panamá]({IPC_SOURCE_URL})."
