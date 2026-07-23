@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from html import unescape
 from io import BytesIO
 import os
 from pathlib import Path
+from PIL import Image, ImageFilter, ImageOps
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Iterable, Optional
 import re
 import sys
@@ -38,7 +43,8 @@ IPC_SOURCE_URL = "https://www.inec.gob.pa/publicaciones/Default3.aspx?ID_CATEGOR
 WORLD_BANK_API_BASE = "https://api.worldbank.org/v2"
 WORLD_BANK_DATA_URL = "https://data.worldbank.org"
 EIA_BRENT_SOURCE_URL = "https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?f=m&n=PET&s=RBRTE"
-PRICE_UNIT = "B/./litro"
+OFFICIAL_FUEL_POSTS_API = "https://www.energia.gob.pa/wp-json/wp/v2/posts"
+PRICE_UNIT = "B/. / litro"
 MIN_REASONABLE_PRICE = 0.05
 MAX_REASONABLE_PRICE = 10.0
 MIN_TARGET_MEDIAN_PRICE = 0.20
@@ -250,8 +256,112 @@ def detect_live_prices_from_table(df: pd.DataFrame) -> dict[str, float]:
     return detected
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_live_panama_prices() -> tuple[dict[str, float], Optional[str]]:
+def normalize_live_price_token(token: str) -> float:
+    token = str(token).strip()
+    direct = parse_number(token)
+    if np.isfinite(direct) and MIN_REASONABLE_PRICE <= direct <= MAX_REASONABLE_PRICE:
+        return float(direct)
+
+    digits = re.sub(r"[^0-9]", "", token)
+    if len(digits) == 4:
+        inferred = int(digits) / 1000
+        if MIN_REASONABLE_PRICE <= inferred <= MAX_REASONABLE_PRICE:
+            return float(inferred)
+    return np.nan
+
+
+def fetch_latest_official_fuel_post() -> dict[str, str]:
+    response = requests.get(
+        OFFICIAL_FUEL_POSTS_API,
+        params={"search": "combustibles", "per_page": 10},
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; FuelForecastPrototype/4.0)"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("La API oficial de comunicados no devolvió una lista de publicaciones.")
+
+    for post in payload:
+        title = unescape(str(post.get("title", {}).get("rendered", "")))
+        slug = str(post.get("slug", ""))
+        if "actualizacion-de-los-precios-de-los-combustibles" not in slug:
+            continue
+        html = unescape(str(post.get("content", {}).get("rendered", "")))
+        image_match = re.search(r'href="([^"]*Precio-por-localidad[^"]+)"', html, flags=re.IGNORECASE)
+        if not image_match:
+            image_match = re.search(r'src="([^"]*Precio-por-localidad[^"]+)"', html, flags=re.IGNORECASE)
+        if not image_match:
+            continue
+        return {
+            "title": title,
+            "post_url": str(post.get("link", "")),
+            "image_url": image_match.group(1).replace("http://", "https://"),
+        }
+    raise ValueError("No se encontró una publicación oficial reciente con la tabla de precios por localidad.")
+
+
+def extract_panama_prices_from_official_image(image_bytes: bytes) -> dict[str, float]:
+    if shutil.which("tesseract") is None:
+        raise ValueError("Tesseract no está disponible para leer la tabla oficial por imagen.")
+
+    with Image.open(BytesIO(image_bytes)) as raw_image:
+        image = raw_image.convert("RGB")
+    width, height = image.size
+    crop = image.crop((0, int(height * 0.1875), width, int(height * 0.2657)))
+    crop = ImageOps.grayscale(crop).resize((crop.width * 5, crop.height * 5))
+    crop = crop.filter(ImageFilter.SHARPEN)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+        temp_path = Path(handle.name)
+    try:
+        crop.save(temp_path)
+        result = subprocess.run(
+            ["tesseract", str(temp_path), "stdout", "--psm", "6"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    panama_line = next(
+        (
+            line.strip()
+            for line in result.stdout.splitlines()
+            if "panama" in normalize_name(line) and "colon" in normalize_name(line)
+        ),
+        "",
+    )
+    if not panama_line:
+        raise ValueError("No se pudo leer la fila de Panamá / Colón en la tabla oficial.")
+
+    tokens = re.findall(r"\d+(?:\.\d+)?", panama_line)
+    if len(tokens) < 3:
+        raise ValueError("La fila de Panamá / Colón no contiene tres precios legibles.")
+    values = [normalize_live_price_token(token) for token in tokens[-3:]]
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError("Los precios detectados en la tabla oficial no son válidos.")
+    return {
+        "gasolina_95": float(values[0]),
+        "gasolina_91": float(values[1]),
+        "diesel": float(values[2]),
+    }
+
+
+def fetch_live_panama_prices_from_official_post() -> tuple[dict[str, float], str, str]:
+    post = fetch_latest_official_fuel_post()
+    response = requests.get(
+        post["image_url"],
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; FuelForecastPrototype/4.0)"},
+    )
+    response.raise_for_status()
+    prices = extract_panama_prices_from_official_image(response.content)
+    return prices, post["post_url"], post["title"]
+
+
+def fetch_live_panama_prices_from_tables() -> tuple[dict[str, float], Optional[str]]:
     candidate_urls = [
         "https://www.energia.gob.pa/precios-de-combustibles/",
         "https://energia.gob.pa/precios-de-combustibles/",
@@ -272,6 +382,20 @@ def fetch_live_panama_prices() -> tuple[dict[str, float], Optional[str]]:
         if merged:
             return merged, url
     return {}, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_panama_prices() -> tuple[dict[str, float], Optional[str], str]:
+    try:
+        prices, source_url, source_label = fetch_live_panama_prices_from_official_post()
+        return prices, source_url, source_label
+    except (requests.RequestException, ValueError, OSError, subprocess.SubprocessError):
+        pass
+
+    prices, source_url = fetch_live_panama_prices_from_tables()
+    if prices:
+        return prices, source_url, "Fuente oficial tabular"
+    return {}, None, ""
 
 
 def load_sheet_with_header_detection(file_obj: Any, sheet_name: str) -> tuple[pd.DataFrame, int]:
@@ -701,14 +825,86 @@ def create_ipc_lag_figure(ccf_df: pd.DataFrame, sector: str):
     ax.plot(data["rezago_meses"], -data["banda_95_aprox"], color="#ef6a4c", linewidth=1.4)
     ax.axhline(0, color="#667085", linewidth=0.9)
     ax.set(
-        title=f"CCF: {FUEL_NAMES[data['combustible'].iloc[0]]} → {IPC_SECTOR_NAMES[sector]}",
-        xlabel="Rezago del combustible (meses)",
-        ylabel="Correlación de variaciones mensuales",
+        title=f"Cómo se transmite {FUEL_NAMES[data['combustible'].iloc[0]]} hacia {IPC_SECTOR_NAMES[sector]}",
+        xlabel="Meses en que tarda el efecto del combustible",
+        ylabel="Relación temporal de las variaciones",
     )
     ax.set_xticks(data["rezago_meses"])
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     return fig
+
+
+def describe_ipc_relationship(correlation: float, p_value: float) -> str:
+    if not np.isfinite(correlation):
+        return "Sin señal"
+    strength = abs(float(correlation))
+    if np.isfinite(p_value) and p_value < 0.05 and strength >= 0.4:
+        return "Alta"
+    if np.isfinite(p_value) and p_value < 0.10 and strength >= 0.2:
+        return "Media"
+    if strength >= 0.1:
+        return "Baja"
+    return "No concluyente"
+
+
+def describe_ipc_confidence(p_value: float) -> str:
+    if not np.isfinite(p_value):
+        return "Sin dato"
+    if p_value < 0.01:
+        return "Alta"
+    if p_value < 0.05:
+        return "Media"
+    if p_value < 0.10:
+        return "Baja"
+    return "Muy baja"
+
+
+def describe_ipc_predictive_effect(improvement: float) -> str:
+    if not np.isfinite(improvement):
+        return "Sin dato"
+    if improvement > 5:
+        return "Sí mejora"
+    if improvement > 0:
+        return "Mejora leve"
+    if improvement > -5:
+        return "No mejora"
+    return "Empeora"
+
+
+def describe_ipc_direction(correlation: float) -> str:
+    if not np.isfinite(correlation):
+        return "Sin dirección clara"
+    return "Positiva" if correlation >= 0 else "Negativa"
+
+
+def render_ipc_sector_cards(summary_df: pd.DataFrame, selected_sector: str) -> None:
+    ordered_df = summary_df.copy()
+    ordered_df["_selected_first"] = ordered_df["sector"] != selected_sector
+    ordered_df = ordered_df.sort_values(["_selected_first", "sector_nombre"]).drop(columns="_selected_first")
+    card_columns = st.columns(2)
+    for index, (_, row) in enumerate(ordered_df.iterrows()):
+        relationship = describe_ipc_relationship(row["correlacion_ccf"], row["p_valor_ccf"])
+        confidence = describe_ipc_confidence(row["p_valor_ccf"])
+        predictive = describe_ipc_predictive_effect(row["mejora_mae_pct"])
+        direction = describe_ipc_direction(row["correlacion_ccf"])
+        lag_text = f"{int(row['rezago_predictivo_meses'])} meses"
+        long_term = "Sí" if bool(row["cointegracion_5_pct"]) else "No clara"
+        predictive_detail = (
+            f"{predictive} ({float(row['mejora_mae_pct']):+.1f}% en MAE)"
+            if np.isfinite(row["mejora_mae_pct"])
+            else predictive
+        )
+        with card_columns[index % len(card_columns)]:
+            with st.container(border=True):
+                if row["sector"] == selected_sector:
+                    st.caption("Sector seleccionado")
+                st.markdown(f"**{row['sector_nombre']}**")
+                st.write(f"Relación: **{relationship}**")
+                st.write(f"Dirección: **{direction}**")
+                st.write(f"Tiempo de efecto: **{lag_text}**")
+                st.write(f"Pronóstico: **{predictive_detail}**")
+                st.caption(f"Confianza: {confidence} · Largo plazo: {long_term}")
 
 
 @st.cache_data(ttl=86_400, show_spinner=False)
@@ -853,12 +1049,78 @@ def create_regional_exposure_figure(normalized_df: pd.DataFrame):
     ax.set_yticks(y)
     ax.set_yticklabels(metrics)
     ax.set_xlim(0, 105)
-    ax.set_xlabel("Exposición relativa dentro del bloque (0–100)")
-    ax.set_title("Comparación estructural regional normalizada")
+    ax.set_xlabel("Presión relativa dentro del bloque (0–100)")
+    ax.set_title("Dónde se concentra la presión relativa en el bloque")
     ax.grid(axis="x", alpha=0.25)
     ax.legend(frameon=False, ncol=3, loc="lower center", bbox_to_anchor=(0.5, -0.28))
     fig.tight_layout()
     return fig
+
+
+def describe_regional_exposure(score: float) -> str:
+    if not np.isfinite(score):
+        return "Sin dato"
+    if score >= 67:
+        return "Alta"
+    if score >= 34:
+        return "Media"
+    return "Baja"
+
+
+def pick_regional_driver(row: pd.Series, metric_columns: list[str]) -> str:
+    values = {column: float(row[column]) for column in metric_columns if np.isfinite(row[column])}
+    if not values:
+        return "Sin dato"
+    return max(values, key=values.get)
+
+
+def build_regional_country_view(summary_df: pd.DataFrame, normalized_df: pd.DataFrame) -> pd.DataFrame:
+    metric_columns = [
+        "Dependencia importadora",
+        "Fricción logística",
+        "Presión inflacionaria",
+        "Exposición cambiaria",
+    ]
+    country_view = summary_df.merge(normalized_df, on=["codigo_pais", "pais"], how="left")
+    country_view["exposicion_promedio_score"] = country_view[metric_columns].mean(axis=1)
+    country_view["exposicion_relativa"] = country_view["exposicion_promedio_score"].apply(describe_regional_exposure)
+    country_view["principal_presion"] = country_view.apply(
+        lambda row: pick_regional_driver(row, metric_columns),
+        axis=1,
+    )
+    country_view["puesto_bloque"] = (
+        country_view["exposicion_promedio_score"].rank(method="min", ascending=False).astype("Int64")
+    )
+    return country_view
+
+
+def render_regional_country_cards(country_view: pd.DataFrame) -> None:
+    ordered_view = country_view.copy()
+    ordered_view["_panama_first"] = ordered_view["pais"] != "Panamá"
+    ordered_view = ordered_view.sort_values(
+        ["_panama_first", "exposicion_promedio_score"],
+        ascending=[True, False],
+    ).drop(columns="_panama_first")
+    total_countries = len(ordered_view)
+    card_columns = st.columns(3)
+    for index, (_, row) in enumerate(ordered_view.iterrows()):
+        inflation_text = f"{float(row['inflacion_pct']):+.2f}%" if np.isfinite(row["inflacion_pct"]) else "s/d"
+        fx_text = (
+            f"{float(row['variacion_cambiaria_pct']):+.2f}%"
+            if np.isfinite(row["variacion_cambiaria_pct"])
+            else "s/d"
+        )
+        with card_columns[index % len(card_columns)]:
+            with st.container(border=True):
+                if row["pais"] == "Panamá":
+                    st.caption("País de referencia")
+                st.markdown(f"**{row['pais']}**")
+                st.write(f"Exposición relativa: **{row['exposicion_relativa']}**")
+                st.write(f"Principal presión: **{row['principal_presion']}**")
+                st.write(f"Posición en el bloque: **{int(row['puesto_bloque'])} de {total_countries}**")
+                st.write(f"Dependencia importadora: **{float(row['importacion_combustible_pct']):.2f}%**")
+                st.write(f"Logística: **LPI {float(row['lpi']):.1f}**")
+                st.caption(f"Inflación: {inflation_text} · Tipo de cambio: {fx_text}")
 
 
 def create_exchange_rate_figure(summary_df: pd.DataFrame):
@@ -873,7 +1135,7 @@ def create_exchange_rate_figure(summary_df: pd.DataFrame):
     )
     ax.axhline(0, color="#667085", linewidth=1.0)
     ax.set_ylabel("Variación anual frente al USD (%)")
-    ax.set_title("Tipo de cambio: cambio anual de la moneda local por USD")
+    ax.set_title("Qué tanto cambió cada moneda frente al dólar")
     ax.grid(axis="y", alpha=0.25)
     for index, row in display.reset_index(drop=True).iterrows():
         value = float(row["variacion_cambiaria_pct"])
@@ -882,6 +1144,77 @@ def create_exchange_rate_figure(summary_df: pd.DataFrame):
         ax.text(index, value + offset, f"{value:+.2f}%", ha="center", va=va, fontsize=9)
     fig.tight_layout()
     return fig
+
+
+def describe_fx_pressure(delta: float) -> str:
+    if not np.isfinite(delta):
+        return "Sin dato"
+    magnitude = abs(float(delta))
+    if magnitude >= 5:
+        return "Alta"
+    if magnitude >= 1:
+        return "Media"
+    return "Baja"
+
+
+def describe_fx_direction(delta: float) -> str:
+    if not np.isfinite(delta):
+        return "Sin dato"
+    if delta >= 0.25:
+        return "Se debilitó"
+    if delta <= -0.25:
+        return "Se fortaleció"
+    return "Se mantuvo estable"
+
+
+def build_fx_country_view(summary_df: pd.DataFrame) -> pd.DataFrame:
+    fx_view = summary_df[
+        [
+            "codigo_pais",
+            "pais",
+            "tipo_cambio_oficial",
+            "tipo_cambio_anio",
+            "variacion_cambiaria_pct",
+            "variacion_cambiaria_anio",
+        ]
+    ].copy()
+    fx_view["presion_cambiaria"] = fx_view["variacion_cambiaria_pct"].apply(describe_fx_pressure)
+    fx_view["movimiento_cambiario"] = fx_view["variacion_cambiaria_pct"].apply(describe_fx_direction)
+    fx_view["magnitud_movimiento"] = fx_view["variacion_cambiaria_pct"].abs()
+    fx_view["puesto_presion"] = (
+        fx_view["magnitud_movimiento"].rank(method="min", ascending=False).astype("Int64")
+    )
+    return fx_view
+
+
+def render_fx_country_cards(fx_view: pd.DataFrame) -> None:
+    ordered_view = fx_view.copy()
+    ordered_view["_panama_first"] = ordered_view["pais"] != "Panamá"
+    ordered_view = ordered_view.sort_values(
+        ["_panama_first", "magnitud_movimiento"],
+        ascending=[True, False],
+    ).drop(columns="_panama_first")
+    total_countries = len(ordered_view)
+    card_columns = st.columns(3)
+    for index, (_, row) in enumerate(ordered_view.iterrows()):
+        value_text = f"{float(row['tipo_cambio_oficial']):.2f}" if np.isfinite(row["tipo_cambio_oficial"]) else "s/d"
+        delta_text = (
+            f"{float(row['variacion_cambiaria_pct']):+.2f}%"
+            if np.isfinite(row["variacion_cambiaria_pct"])
+            else "s/d"
+        )
+        with card_columns[index % len(card_columns)]:
+            with st.container(border=True):
+                if row["pais"] == "Panamá":
+                    st.caption("País de referencia")
+                st.markdown(f"**{row['pais']}**")
+                st.write(f"Presión cambiaria: **{row['presion_cambiaria']}**")
+                st.write(f"Movimiento reciente: **{row['movimiento_cambiario']}**")
+                st.write(f"Posición en el bloque: **{int(row['puesto_presion'])} de {total_countries}**")
+                st.write(f"Tipo oficial: **{value_text}**")
+                st.caption(
+                    f"{REGIONAL_CURRENCY_LABELS[row['codigo_pais']]} · Variación anual: {delta_text}"
+                )
 
 
 def create_logistics_freight_figure(summary_df: pd.DataFrame):
@@ -911,9 +1244,91 @@ def create_logistics_freight_figure(summary_df: pd.DataFrame):
 
     for axis in axes:
         axis.tick_params(axis="x", rotation=0)
-    fig.suptitle("Fletes y logística: presión estructural del abastecimiento", y=1.02)
+    fig.suptitle("Qué tan presionado está el abastecimiento", y=1.02)
     fig.tight_layout()
     return fig
+
+
+def describe_logistics_pressure(score: float) -> str:
+    if not np.isfinite(score):
+        return "Sin dato"
+    if score >= 67:
+        return "Alta"
+    if score >= 34:
+        return "Media"
+    return "Baja"
+
+
+def build_logistics_country_view(summary_df: pd.DataFrame, normalized_df: pd.DataFrame) -> pd.DataFrame:
+    logistics_view = summary_df[
+        [
+            "codigo_pais",
+            "pais",
+            "lpi",
+            "lpi_anio",
+            "importacion_combustible_pct",
+            "importacion_combustible_pct_anio",
+            "presion_fletes_logistica_score",
+        ]
+    ].copy()
+    normalized_subset = normalized_df[
+        [
+            "codigo_pais",
+            "pais",
+            "Dependencia importadora",
+            "Fricción logística",
+        ]
+    ].copy()
+    logistics_view = logistics_view.merge(
+        normalized_subset,
+        on=["codigo_pais", "pais"],
+        how="left",
+    )
+    logistics_view["presion_logistica"] = logistics_view["presion_fletes_logistica_score"].apply(
+        describe_logistics_pressure
+    )
+    logistics_view["principal_factor"] = np.where(
+        logistics_view["Dependencia importadora"] >= logistics_view["Fricción logística"],
+        "Dependencia importadora",
+        "Fricción logística",
+    )
+    logistics_view["puesto_presion"] = (
+        logistics_view["presion_fletes_logistica_score"].rank(method="min", ascending=False).astype("Int64")
+    )
+    return logistics_view
+
+
+def render_logistics_country_cards(logistics_view: pd.DataFrame) -> None:
+    ordered_view = logistics_view.copy()
+    ordered_view["_panama_first"] = ordered_view["pais"] != "Panamá"
+    ordered_view = ordered_view.sort_values(
+        ["_panama_first", "presion_fletes_logistica_score"],
+        ascending=[True, False],
+    ).drop(columns="_panama_first")
+    total_countries = len(ordered_view)
+    card_columns = st.columns(3)
+    for index, (_, row) in enumerate(ordered_view.iterrows()):
+        import_text = (
+            f"{float(row['importacion_combustible_pct']):.2f}%"
+            if np.isfinite(row["importacion_combustible_pct"])
+            else "s/d"
+        )
+        lpi_text = f"{float(row['lpi']):.1f}" if np.isfinite(row["lpi"]) else "s/d"
+        with card_columns[index % len(card_columns)]:
+            with st.container(border=True):
+                if row["pais"] == "Panamá":
+                    st.caption("País de referencia")
+                st.markdown(f"**{row['pais']}**")
+                st.write(f"Presión logística: **{row['presion_logistica']}**")
+                st.write(f"Principal factor: **{row['principal_factor']}**")
+                st.write(f"Posición en el bloque: **{int(row['puesto_presion'])} de {total_countries}**")
+                st.write(f"Dependencia importadora: **{import_text}**")
+                st.write(f"Desempeño logístico: **LPI {lpi_text}**")
+                st.caption(
+                    f"Presión compuesta: {float(row['presion_fletes_logistica_score']):.1f}/100"
+                    if np.isfinite(row["presion_fletes_logistica_score"])
+                    else "Presión compuesta: s/d"
+                )
 
 
 def load_regional_elasticity_data(source: Any) -> pd.DataFrame:
@@ -1512,11 +1927,72 @@ def render_validation_table(summary_df: pd.DataFrame) -> None:
         column_config={
             "serie": st.column_config.TextColumn("Combustible", width="small"),
             "modelo": st.column_config.TextColumn("Modelo", width="medium"),
-            "mae_validacion": st.column_config.NumberColumn("MAE", format="%.4f", width="small"),
+            "mae_validacion": st.column_config.NumberColumn("MAE (error absoluto medio)", format="%.4f", width="small"),
             "meses_validacion": st.column_config.NumberColumn("Meses val.", format="%d", width="small"),
             "direccion_esperada": st.column_config.TextColumn("Señal", width="small"),
         },
     )
+
+
+def describe_brent_effect(improvement: float) -> str:
+    if not np.isfinite(improvement):
+        return "Sin dato"
+    if improvement >= 20:
+        return "Alta"
+    if improvement >= 5:
+        return "Media"
+    if improvement > 0:
+        return "Leve"
+    if improvement > -5:
+        return "No mejora"
+    return "Empeora"
+
+
+def build_brent_summary_view(summary_df: pd.DataFrame) -> pd.DataFrame:
+    brent_view = summary_df[
+        [
+            "serie",
+            "mae_historico",
+            "mae_con_brent",
+            "mejora_mae_brent_pct",
+            "rezago_brent_meses",
+            "modelo_ganador",
+        ]
+    ].copy()
+    brent_view["combustible"] = brent_view["serie"].map(FUEL_NAMES)
+    brent_view["apoyo_brent"] = brent_view["mejora_mae_brent_pct"].apply(describe_brent_effect)
+    brent_view["mejora_abs"] = brent_view["mejora_mae_brent_pct"].abs()
+    return brent_view
+
+
+def render_brent_model_cards(brent_view: pd.DataFrame) -> None:
+    ordered_view = brent_view.copy()
+    ordered_view["_brent_first"] = ordered_view["modelo_ganador"] != "Brent"
+    ordered_view = ordered_view.sort_values(
+        ["_brent_first", "mejora_mae_brent_pct"],
+        ascending=[True, False],
+    ).drop(columns="_brent_first")
+    card_columns = st.columns(3)
+    for index, (_, row) in enumerate(ordered_view.iterrows()):
+        lag_text = (
+            f"{int(row['rezago_brent_meses'])} mes(es)"
+            if np.isfinite(row["rezago_brent_meses"])
+            else "s/d"
+        )
+        improvement_text = (
+            f"{float(row['mejora_mae_brent_pct']):+.1f}%"
+            if np.isfinite(row["mejora_mae_brent_pct"])
+            else "s/d"
+        )
+        with card_columns[index % len(card_columns)]:
+            with st.container(border=True):
+                st.markdown(f"**{row['combustible']}**")
+                st.write(f"Apoyo de Brent: **{row['apoyo_brent']}**")
+                st.write(f"Modelo ganador: **{row['modelo_ganador']}**")
+                st.write(f"Rezago útil: **{lag_text}**")
+                st.write(f"MAE histórico: **{float(row['mae_historico']):.4f}**")
+                st.write(f"MAE con Brent: **{float(row['mae_con_brent']):.4f}**")
+                st.caption(f"Cambio en MAE: {improvement_text}")
 
 
 def render_forecast_cards_final(summary_df: pd.DataFrame, selected_horizon: int) -> None:
@@ -1526,20 +2002,34 @@ def render_forecast_cards_final(summary_df: pd.DataFrame, selected_horizon: int)
     columns = st.columns(len(summary_df))
     for column, (_, row) in zip(columns, summary_df.iterrows()):
         name = FUEL_NAMES.get(str(row["serie"]), str(row["serie"]))
+        current_price = float(row["ultimo_valor_historico"])
+        projected_price = float(row[forecast_col])
+        delta_amount = projected_price - current_price
+        delta_pct = (delta_amount / current_price * 100) if current_price else 0.0
+        if np.isclose(delta_amount, 0.0, atol=0.0001):
+            trend_label = "Se mantiene"
+            delta_label = f"{delta_amount:+.4f} {PRICE_UNIT}"
+        elif delta_amount > 0:
+            trend_label = "Sube"
+            delta_label = f"+{abs(delta_amount):.4f} {PRICE_UNIT}"
+        else:
+            trend_label = "Baja"
+            delta_label = f"-{abs(delta_amount):.4f} {PRICE_UNIT}"
         with column:
             with st.container(border=True):
                 st.caption(f"Mes {selected_horizon}")
-                st.metric(name, f"{float(row[forecast_col]):.4f} {PRICE_UNIT}")
-                st.caption("Intervalo aproximado del 95 %")
+                st.metric(name, trend_label, delta_label)
+                st.write(f"Cambio estimado: {delta_pct:+.1f}%")
+                st.caption(f"Último precio: {current_price:.4f} {PRICE_UNIT}")
+                st.caption(f"Precio estimado en mes {selected_horizon}: {projected_price:.4f} {PRICE_UNIT}")
+                st.caption("Rango aproximado del 95 %")
                 st.write(f"{float(row[lower_col]):.4f}–{float(row[upper_col]):.4f} {PRICE_UNIT}")
-                st.caption("Tendencia central")
-                st.write(str(row["direccion_esperada"]).capitalize())
 
 
 def render_live_prices_box(monthly_df: pd.DataFrame) -> None:
     st.subheader("Precios de referencia en Panamá")
     with st.spinner("Consultando precios vigentes..."):
-        prices, source_url = fetch_live_panama_prices()
+        prices, source_url, source_label = fetch_live_panama_prices()
     reference_mode = "live"
     source_text = ""
     if not prices:
@@ -1559,9 +2049,12 @@ def render_live_prices_box(monthly_df: pd.DataFrame) -> None:
         st.info("No se pudieron validar precios vigentes en línea; se muestran los últimos valores del historial local.")
     cols = st.columns(len(prices))
     for column, (key, value) in zip(cols, prices.items()):
-        column.metric(FUEL_NAMES[key], f"{value:.4f} {PRICE_UNIT}")
+        with column:
+            st.metric(FUEL_NAMES[key], f"{value:.4f}")
+            st.write(f"**Unidad:** {PRICE_UNIT}")
     if source_url and reference_mode == "live":
-        st.caption(f"Fuente: {source_url} · Consulta almacenada durante una hora")
+        source_note = f"{source_label} · {source_url}" if source_label else source_url
+        st.caption(f"Fuente: {source_note} · Consulta almacenada durante una hora")
     elif source_text:
         st.caption(source_text)
 
@@ -1632,7 +2125,7 @@ def main() -> None:
     st.header("Pronóstico con variable externa")
     st.caption(
         "Compara el mejor modelo histórico con una regresión dinámica que incorpora la variación mensual del Brent. "
-        "La validación utiliza el mismo bloque temporal final y selecciona automáticamente el menor MAE."
+        "La validación utiliza el mismo bloque temporal final y selecciona automáticamente el menor MAE (error absoluto medio)."
     )
     if brent_series is None or brent_monthly_df.empty:
         st.warning(
@@ -1643,6 +2136,18 @@ def main() -> None:
         try:
             forecast_end = monthly_df["periodo"].max() + pd.offsets.MonthBegin(selected_horizon)
             brent_projection_df = build_brent_projection(brent_monthly_df, forecast_end)
+            brent_view = build_brent_summary_view(summary_df)
+            brent_winners = int((brent_view["modelo_ganador"] == "Brent").sum())
+            best_brent_row = brent_view.sort_values("mejora_mae_brent_pct", ascending=False).iloc[0]
+            winning_lags = brent_view.loc[brent_view["modelo_ganador"] == "Brent", "rezago_brent_meses"].dropna()
+            if winning_lags.empty:
+                common_brent_lag = (
+                    int(best_brent_row["rezago_brent_meses"])
+                    if np.isfinite(best_brent_row["rezago_brent_meses"])
+                    else None
+                )
+            else:
+                common_brent_lag = int(winning_lags.mode().iloc[0])
             phase3_col1, phase3_col2 = st.columns([1.25, 1])
             with phase3_col1:
                 history_start = max(
@@ -1660,35 +2165,51 @@ def main() -> None:
                     f"US${latest_brent['brent_usd_barril']:.2f}/barril",
                     help=f"Último mes completo disponible: {latest_brent['periodo']:%Y-%m}",
                 )
-                phase3_display = summary_df[
+                st.subheader("Lectura rápida")
+                brent_quick_col1, brent_quick_col2 = st.columns(2)
+                with brent_quick_col1:
+                    st.metric("Brent ayuda en", f"{brent_winners} de {len(brent_view)}")
+                    st.metric("Mayor mejora", best_brent_row["combustible"])
+                with brent_quick_col2:
+                    st.metric(
+                        "Mejora máxima",
+                        f"{float(best_brent_row['mejora_mae_brent_pct']):.1f}%",
+                    )
+                    st.metric(
+                        "Rezago más útil",
+                        f"{common_brent_lag} mes(es)" if common_brent_lag is not None else "s/d",
+                    )
+                st.info(
+                    f"En esta comparación, **Brent** mejora el pronóstico en **{brent_winners} de {len(brent_view)}** combustibles. "
+                    f"La mayor reducción del error aparece en **{best_brent_row['combustible']}** "
+                    f"con **{float(best_brent_row['mejora_mae_brent_pct']):.1f}%**."
+                )
+
+            with st.expander("Resumen por combustible", expanded=False):
+                render_brent_model_cards(brent_view)
+
+            with st.expander("Ver detalle técnico de Brent"):
+                phase3_display = brent_view[
                     [
-                        "serie",
+                        "combustible",
                         "mae_historico",
                         "mae_con_brent",
                         "mejora_mae_brent_pct",
                         "rezago_brent_meses",
                         "modelo_ganador",
                     ]
-                ].copy()
-                phase3_display["serie"] = phase3_display["serie"].map(FUEL_NAMES)
-                phase3_display = phase3_display.rename(
+                ].rename(
                     columns={
-                        "serie": "Combustible",
-                        "mae_historico": "MAE histórico",
-                        "mae_con_brent": "MAE con Brent",
-                        "mejora_mae_brent_pct": "Mejora MAE (%)",
+                        "combustible": "Combustible",
+                        "mae_historico": "MAE histórico (error absoluto medio)",
+                        "mae_con_brent": "MAE con Brent (error absoluto medio)",
+                        "mejora_mae_brent_pct": "Mejora MAE (error absoluto medio, %)",
                         "rezago_brent_meses": "Rezago Brent",
                         "modelo_ganador": "Modelo ganador",
                     }
                 )
                 st.dataframe(phase3_display, width="stretch", hide_index=True)
 
-            winners = int((summary_df["modelo_ganador"] == "Brent").sum())
-            st.info(
-                f"Resultado de selección: el modelo con Brent ganó para {winners} de "
-                f"{len(summary_df)} combustibles. Cuando no reduce el MAE, la aplicación conserva el modelo histórico. "
-                "El rezago indica cuántos meses tarda la variación del Brent en aportar señal predictiva."
-            )
             st.caption(
                 f"Fuente y descarga mensual automatizada: [U.S. Energy Information Administration]({EIA_BRENT_SOURCE_URL}). "
                 "Para meses futuros, Brent se extiende con un modelo auxiliar validado; no representa una cotización futura de mercado."
@@ -1737,11 +2258,45 @@ def main() -> None:
                 format_func=lambda value: IPC_SECTOR_NAMES[value],
                 key="ipc_sector_name",
             )
+            selected_result = sectoral_summary_df[sectoral_summary_df["sector"] == selected_sector].iloc[0]
+            relationship = describe_ipc_relationship(
+                selected_result["correlacion_ccf"],
+                selected_result["p_valor_ccf"],
+            )
+            predictive = describe_ipc_predictive_effect(selected_result["mejora_mae_pct"])
+            long_term = "Sí" if bool(selected_result["cointegracion_5_pct"]) else "No clara"
+            direction = describe_ipc_direction(selected_result["correlacion_ccf"])
+            ccf_lag = int(selected_result["rezago_ccf_meses"])
+            predictive_lag = int(selected_result["rezago_predictivo_meses"])
+            improvement = float(selected_result["mejora_mae_pct"])
 
             ipc_col1, ipc_col2 = st.columns([1.25, 1])
             with ipc_col1:
                 st.pyplot(create_ipc_lag_figure(sectoral_ccf_df, selected_sector), clear_figure=True)
             with ipc_col2:
+                st.subheader("Lectura rápida")
+                metric_col1, metric_col2 = st.columns(2)
+                with metric_col1:
+                    st.metric("¿Hay relación?", relationship)
+                    st.metric("¿Mejora el pronóstico?", predictive)
+                with metric_col2:
+                    st.metric("¿Cuánto tarda en sentirse?", f"{predictive_lag} meses")
+                    st.metric("¿Hay señal de largo plazo?", long_term)
+                effect_text = (
+                    f"mejora el MAE (error absoluto medio) en {improvement:.1f}%"
+                    if improvement > 0
+                    else f"no mejora el MAE (error absoluto medio) y cambia {improvement:.1f}%"
+                )
+                st.info(
+                    f"Para **{selected_result['sector_nombre']}**, la señal observada es **{direction.lower()}**. "
+                    f"La relación más visible aparece alrededor de **{ccf_lag} meses** y, al usar esta señal en el modelo, "
+                    f"el mejor desfase práctico es **{predictive_lag} meses**. En términos predictivos, esta variable **{effect_text}**."
+                )
+
+            with st.expander("Resumen por sector", expanded=False):
+                render_ipc_sector_cards(sectoral_summary_df, selected_sector)
+
+            with st.expander("Ver detalle técnico del análisis"):
                 display_summary = sectoral_summary_df[
                     [
                         "sector_nombre",
@@ -1756,92 +2311,77 @@ def main() -> None:
                 ].rename(
                     columns={
                         "sector_nombre": "Componente IPC",
-                        "rezago_ccf_meses": "Rezago CCF",
-                        "correlacion_ccf": "Correlación",
-                        "p_valor_ccf": "p-valor",
-                        "rezago_predictivo_meses": "Rezago predictivo",
-                        "mae_base": "MAE base",
-                        "mae_con_combustible": "MAE con combustible",
-                        "mejora_mae_pct": "Mejora MAE (%)",
+                        "rezago_ccf_meses": "Meses donde se ve más la relación",
+                        "correlacion_ccf": "Relación temporal",
+                        "p_valor_ccf": "Confianza estadística (p-valor)",
+                        "rezago_predictivo_meses": "Meses usados en el pronóstico",
+                        "mae_base": "MAE base (error absoluto medio)",
+                        "mae_con_combustible": "MAE con combustible (error absoluto medio)",
+                        "mejora_mae_pct": "Cambio porcentual del MAE",
                     }
                 )
                 st.dataframe(display_summary, width="stretch", hide_index=True)
 
-            selected_result = sectoral_summary_df[sectoral_summary_df["sector"] == selected_sector].iloc[0]
-            significance = "estadísticamente distinguible de cero al 5 %" if selected_result["p_valor_ccf"] < 0.05 else "no significativa al 5 %"
-            direction = "positiva" if selected_result["correlacion_ccf"] >= 0 else "negativa"
-            improvement = selected_result["mejora_mae_pct"]
-            predictive_text = (
-                f"El modelo con combustible redujo el MAE final en {improvement:.1f} %."
-                if improvement > 0
-                else f"El combustible no mejoró el MAE final ({improvement:.1f} %)."
-            )
-            st.info(
-                f"Lectura: la asociación más intensa es {direction} con un rezago de "
-                f"{int(selected_result['rezago_ccf_meses'])} meses y resulta {significance}. "
-                f"El rezago predictivo elegido fue {int(selected_result['rezago_predictivo_meses'])} meses. "
-                f"{predictive_text}"
-            )
-            st.subheader("Granger y cointegración")
-            causal_display = sectoral_summary_df[
-                [
-                    "sector_nombre",
-                    "granger_combustible_ipc_rezago",
-                    "granger_combustible_ipc_p_valor",
-                    "granger_ipc_combustible_rezago",
-                    "granger_ipc_combustible_p_valor",
-                    "cointegracion_p_valor",
-                    "cointegracion_5_pct",
-                ]
-            ].rename(
-                columns={
-                    "sector_nombre": "Componente IPC",
-                    "granger_combustible_ipc_rezago": "Rezago Granger comb.→IPC",
-                    "granger_combustible_ipc_p_valor": "p-valor comb.→IPC",
-                    "granger_ipc_combustible_rezago": "Rezago Granger IPC→comb.",
-                    "granger_ipc_combustible_p_valor": "p-valor IPC→comb.",
-                    "cointegracion_p_valor": "p-valor cointegración",
-                    "cointegracion_5_pct": "Cointegrada al 5%",
-                }
-            )
-            st.dataframe(causal_display, width="stretch", hide_index=True)
+                st.subheader("Granger y cointegración")
+                causal_display = sectoral_summary_df[
+                    [
+                        "sector_nombre",
+                        "granger_combustible_ipc_rezago",
+                        "granger_combustible_ipc_p_valor",
+                        "granger_ipc_combustible_rezago",
+                        "granger_ipc_combustible_p_valor",
+                        "cointegracion_p_valor",
+                        "cointegracion_5_pct",
+                    ]
+                ].rename(
+                    columns={
+                        "sector_nombre": "Componente IPC",
+                        "granger_combustible_ipc_rezago": "Rezago Granger comb.→IPC",
+                        "granger_combustible_ipc_p_valor": "p-valor comb.→IPC",
+                        "granger_ipc_combustible_rezago": "Rezago Granger IPC→comb.",
+                        "granger_ipc_combustible_p_valor": "p-valor IPC→comb.",
+                        "cointegracion_p_valor": "p-valor cointegración",
+                        "cointegracion_5_pct": "Cointegrada al 5%",
+                    }
+                )
+                st.dataframe(causal_display, width="stretch", hide_index=True)
 
-            granger_forward_sig = bool(selected_result["granger_combustible_ipc_significativo"])
-            granger_reverse_sig = bool(selected_result["granger_ipc_combustible_significativo"])
-            coint_sig = bool(selected_result["cointegracion_5_pct"])
-            if granger_forward_sig:
-                granger_forward_text = (
-                    f"Sí hay evidencia de precedencia temporal tipo Granger desde el combustible hacia "
-                    f"{selected_result['sector_nombre']} con mejor rezago de "
-                    f"{int(selected_result['granger_combustible_ipc_rezago'])} meses."
-                )
-            else:
-                granger_forward_text = (
-                    f"No hay evidencia suficiente al 5 % de precedencia tipo Granger desde el combustible hacia "
-                    f"{selected_result['sector_nombre']}."
-                )
+                granger_forward_sig = bool(selected_result["granger_combustible_ipc_significativo"])
+                granger_reverse_sig = bool(selected_result["granger_ipc_combustible_significativo"])
+                coint_sig = bool(selected_result["cointegracion_5_pct"])
+                if granger_forward_sig:
+                    granger_forward_text = (
+                        f"Sí hay evidencia de precedencia temporal tipo Granger desde el combustible hacia "
+                        f"{selected_result['sector_nombre']} con mejor rezago de "
+                        f"{int(selected_result['granger_combustible_ipc_rezago'])} meses."
+                    )
+                else:
+                    granger_forward_text = (
+                        f"No hay evidencia suficiente al 5 % de precedencia tipo Granger desde el combustible hacia "
+                        f"{selected_result['sector_nombre']}."
+                    )
 
-            if granger_reverse_sig:
-                granger_reverse_text = (
-                    f"En sentido inverso, el IPC sectorial también muestra señal temporal sobre el combustible "
-                    f"con mejor rezago de {int(selected_result['granger_ipc_combustible_rezago'])} meses."
-                )
-            else:
-                granger_reverse_text = (
-                    "En sentido inverso no aparece evidencia fuerte al 5 % en la prueba de Granger."
-                )
+                if granger_reverse_sig:
+                    granger_reverse_text = (
+                        f"En sentido inverso, el IPC sectorial también muestra señal temporal sobre el combustible "
+                        f"con mejor rezago de {int(selected_result['granger_ipc_combustible_rezago'])} meses."
+                    )
+                else:
+                    granger_reverse_text = (
+                        "En sentido inverso no aparece evidencia fuerte al 5 % en la prueba de Granger."
+                    )
 
-            if coint_sig:
-                coint_text = (
-                    f"Además, las series en niveles lucen cointegradas al 5 %, lo que sugiere una relación "
-                    f"de equilibrio de largo plazo."
-                )
-            else:
-                coint_text = (
-                    "No aparece cointegración al 5 % en niveles, así que la relación observada parece más "
-                    "de corto/mediano plazo que de equilibrio estable."
-                )
-            st.info(f"{granger_forward_text} {granger_reverse_text} {coint_text}")
+                if coint_sig:
+                    coint_text = (
+                        "Además, las series en niveles lucen cointegradas al 5 %, lo que sugiere una relación "
+                        "de equilibrio de largo plazo."
+                    )
+                else:
+                    coint_text = (
+                        "No aparece cointegración al 5 % en niveles, así que la relación observada parece más "
+                        "de corto/mediano plazo que de equilibrio estable."
+                    )
+                st.info(f"{granger_forward_text} {granger_reverse_text} {coint_text}")
             st.caption(
                 f"Período común: {selected_result['periodo_inicio']:%Y-%m} a "
                 f"{selected_result['periodo_fin']:%Y-%m}. Fuente del IPC: [INEC Panamá]({IPC_SOURCE_URL})."
@@ -1854,20 +2394,58 @@ def main() -> None:
     regional_normalized_df = pd.DataFrame()
     st.divider()
     st.header("Comparación regional estructural")
-    st.caption(
-        "Benchmark Panamá–Costa Rica–República Dominicana con indicadores comparables. "
-        "Las escalas normalizadas describen exposición relativa dentro de este bloque; no son un ranking mundial."
-    )
     try:
         with st.spinner("Consultando indicadores regionales oficiales..."):
             regional_raw_df, regional_summary_df, regional_normalized_df, regional_source_status = (
                 load_regional_benchmark()
             )
+        regional_country_view = build_regional_country_view(
+            regional_summary_df,
+            regional_normalized_df,
+        )
+        most_exposed_row = regional_country_view.sort_values(
+            "exposicion_promedio_score",
+            ascending=False,
+        ).iloc[0]
+        panama_row = regional_country_view[regional_country_view["pais"] == "Panamá"].iloc[0]
+        highest_logistics_row = regional_country_view.sort_values(
+            "Fricción logística",
+            ascending=False,
+        ).iloc[0]
+        highest_fx_row = regional_country_view.sort_values(
+            "Exposición cambiaria",
+            ascending=False,
+        ).iloc[0]
 
+        st.caption(
+            "Benchmark Panamá–Costa Rica–República Dominicana con indicadores comparables. "
+            "La escala 0–100 solo compara estos tres países y ayuda a ubicar dónde se concentra más presión relativa."
+        )
         regional_col1, regional_col2 = st.columns([1.25, 1])
         with regional_col1:
             st.pyplot(create_regional_exposure_figure(regional_normalized_df), clear_figure=True)
         with regional_col2:
+            st.subheader("Lectura rápida")
+            quick_col1, quick_col2 = st.columns(2)
+            with quick_col1:
+                st.metric("País más expuesto", most_exposed_row["pais"])
+                st.metric(
+                    "Panamá en el bloque",
+                    f"{panama_row['exposicion_relativa']} ({int(panama_row['puesto_bloque'])} de {len(regional_country_view)})",
+                )
+            with quick_col2:
+                st.metric("Mayor presión logística", highest_logistics_row["pais"])
+                st.metric("Mayor presión cambiaria", highest_fx_row["pais"])
+            st.info(
+                f"En esta comparación, **{most_exposed_row['pais']}** es el país con mayor exposición relativa. "
+                f"**Panamá** se ubica en la posición **{int(panama_row['puesto_bloque'])} de {len(regional_country_view)}** "
+                f"y su principal presión proviene de **{str(panama_row['principal_presion']).lower()}**."
+            )
+
+        with st.expander("Resumen por país", expanded=False):
+            render_regional_country_cards(regional_country_view)
+
+        with st.expander("Ver detalle técnico de la comparación"):
             regional_display = regional_summary_df[
                 [
                     "pais",
@@ -1901,41 +2479,56 @@ def main() -> None:
             ]
             regional_display[numeric_columns] = regional_display[numeric_columns].round(2)
             st.dataframe(regional_display, width="stretch", hide_index=True)
-
-        st.info(
-            "Lectura: un valor alto en la escala normalizada indica mayor exposición dentro de los tres países. "
-            "La fricción logística invierte el LPI: menor desempeño logístico equivale a mayor fricción. "
-            "La exposición cambiaria usa la magnitud de la variación anual de la moneda frente al dólar."
-        )
+            st.info(
+                "Un valor alto en la escala normalizada indica mayor exposición relativa dentro del bloque. "
+                "La fricción logística invierte el LPI: menor desempeño logístico equivale a mayor fricción. "
+                "La exposición cambiaria usa la magnitud de la variación anual de la moneda frente al dólar."
+            )
 
         st.subheader("Tipo de cambio")
         st.caption(
             "Se muestra el tipo de cambio oficial más reciente frente al dólar y su variación anual. "
             "Una mayor variación sugiere más riesgo de traspaso cambiario hacia combustibles importados."
         )
-        fx_metric_cols = st.columns(len(regional_summary_df))
-        for column, (_, row) in zip(fx_metric_cols, regional_summary_df.iterrows()):
-            value = row["tipo_cambio_oficial"]
-            delta = row["variacion_cambiaria_pct"]
-            year = row["tipo_cambio_anio"]
-            delta_year = row["variacion_cambiaria_anio"]
-            value_text = f"{value:.2f}" if pd.notna(value) else "s/d"
-            if pd.notna(delta):
-                delta_text = f"{delta:+.2f}% anual"
-                help_text = (
-                    f"{REGIONAL_CURRENCY_LABELS[row['codigo_pais']]} en {int(year)}; "
-                    f"variación interanual calculada para {int(delta_year)}."
-                )
-            else:
-                delta_text = "sin variación comparable"
-                help_text = f"{REGIONAL_CURRENCY_LABELS[row['codigo_pais']]} en {int(year)}." if pd.notna(year) else None
-            column.metric(row["pais"], value_text, delta_text, help=help_text)
-            column.caption(REGIONAL_CURRENCY_LABELS[row["codigo_pais"]])
+        fx_country_view = build_fx_country_view(regional_summary_df)
+        fx_most_exposed_row = fx_country_view.sort_values(
+            "magnitud_movimiento",
+            ascending=False,
+        ).iloc[0]
+        fx_stable_row = fx_country_view.sort_values(
+            "magnitud_movimiento",
+            ascending=True,
+        ).iloc[0]
+        panama_fx_row = fx_country_view[fx_country_view["pais"] == "Panamá"].iloc[0]
 
         fx_col1, fx_col2 = st.columns([1.15, 1])
         with fx_col1:
             st.pyplot(create_exchange_rate_figure(regional_summary_df), clear_figure=True)
         with fx_col2:
+            st.subheader("Lectura rápida")
+            fx_quick_col1, fx_quick_col2 = st.columns(2)
+            with fx_quick_col1:
+                st.metric("Mayor presión cambiaria", fx_most_exposed_row["pais"])
+                st.metric(
+                    "Panamá frente al USD",
+                    panama_fx_row["movimiento_cambiario"],
+                )
+            with fx_quick_col2:
+                st.metric("País más estable", fx_stable_row["pais"])
+                st.metric(
+                    "Mayor movimiento anual",
+                    f"{float(fx_most_exposed_row['magnitud_movimiento']):.2f}%",
+                )
+            st.info(
+                f"En este bloque, **{fx_most_exposed_row['pais']}** muestra la mayor presión cambiaria reciente. "
+                f"**Panamá** aparece como referencia **{str(panama_fx_row['movimiento_cambiario']).lower()}**, "
+                f"mientras **{fx_stable_row['pais']}** es el país con menor variación anual."
+            )
+
+        with st.expander("Resumen cambiario por país", expanded=False):
+            render_fx_country_cards(fx_country_view)
+
+        with st.expander("Ver detalle técnico del tipo de cambio"):
             fx_display = regional_summary_df[
                 [
                     "pais",
@@ -1958,24 +2551,56 @@ def main() -> None:
                 ["Tipo de cambio oficial", "Variación anual (%)"]
             ] = fx_display[["Tipo de cambio oficial", "Variación anual (%)"]].round(2)
             st.dataframe(fx_display, width="stretch", hide_index=True)
-
-        highest_fx_country = regional_summary_df.iloc[
-            regional_summary_df["variacion_cambiaria_pct"].abs().fillna(-1).idxmax()
-        ]["pais"]
-        st.info(
-            f"Lectura: Panamá sirve como referencia estable alrededor de 1.00 por su dolarización operativa. "
-            f"Dentro de este bloque, {highest_fx_country} muestra la mayor variación cambiaria reciente frente al USD."
-        )
+            st.info(
+                "La lectura usa la variación anual de la moneda local por USD. "
+                "Un aumento indica más unidades de moneda local por dólar y, por tanto, mayor presión cambiaria."
+            )
 
         st.subheader("Fletes y logística")
         st.caption(
             "Se aproxima con dos señales estructurales oficiales: desempeño logístico (LPI) y dependencia "
             "importadora de combustibles. Mayor dependencia y menor LPI implican más presión potencial de fletes."
         )
+        logistics_country_view = build_logistics_country_view(
+            regional_summary_df,
+            regional_normalized_df,
+        )
+        logistics_most_exposed_row = logistics_country_view.sort_values(
+            "presion_fletes_logistica_score",
+            ascending=False,
+        ).iloc[0]
+        logistics_lowest_lpi_row = logistics_country_view.sort_values("lpi", ascending=True).iloc[0]
+        logistics_highest_import_row = logistics_country_view.sort_values(
+            "importacion_combustible_pct",
+            ascending=False,
+        ).iloc[0]
+        panama_logistics_row = logistics_country_view[logistics_country_view["pais"] == "Panamá"].iloc[0]
+
         logistics_col1, logistics_col2 = st.columns([1.15, 1])
         with logistics_col1:
             st.pyplot(create_logistics_freight_figure(regional_summary_df), clear_figure=True)
         with logistics_col2:
+            st.subheader("Lectura rápida")
+            logistics_quick_col1, logistics_quick_col2 = st.columns(2)
+            with logistics_quick_col1:
+                st.metric("Mayor presión logística", logistics_most_exposed_row["pais"])
+                st.metric(
+                    "Panamá en el bloque",
+                    f"{panama_logistics_row['presion_logistica']} ({int(panama_logistics_row['puesto_presion'])} de {len(logistics_country_view)})",
+                )
+            with logistics_quick_col2:
+                st.metric("Mayor dependencia importadora", logistics_highest_import_row["pais"])
+                st.metric("Menor desempeño logístico", logistics_lowest_lpi_row["pais"])
+            st.info(
+                f"En esta comparación, **{logistics_most_exposed_row['pais']}** concentra la mayor presión logística. "
+                f"**Panamá** ocupa la posición **{int(panama_logistics_row['puesto_presion'])} de {len(logistics_country_view)}** "
+                f"y su principal factor es **{str(panama_logistics_row['principal_factor']).lower()}**."
+            )
+
+        with st.expander("Resumen logístico por país", expanded=False):
+            render_logistics_country_cards(logistics_country_view)
+
+        with st.expander("Ver detalle técnico de fletes y logística"):
             logistics_display = regional_summary_df[
                 [
                     "pais",
@@ -2001,14 +2626,10 @@ def main() -> None:
                 ["LPI", "Combustible / importaciones (%)", "Presión fletes/logística (0-100)"]
             ].round(2)
             st.dataframe(logistics_display, width="stretch", hide_index=True)
-
-        highest_logistics_country = regional_summary_df.iloc[
-            regional_summary_df["presion_fletes_logistica_score"].fillna(-1).idxmax()
-        ]["pais"]
-        st.info(
-            f"Lectura: la presión de fletes y logística combina fricción logística y dependencia importadora. "
-            f"Dentro del bloque analizado, {highest_logistics_country} presenta la mayor exposición estructural."
-        )
+            st.info(
+                "La presión de fletes y logística combina dos señales: menor LPI implica más fricción, "
+                "y una mayor dependencia importadora aumenta la exposición del abastecimiento."
+            )
         st.caption(
             f"Fuente: [World Development Indicators – Banco Mundial]({WORLD_BANK_DATA_URL}). "
             f"Modo de consulta: {regional_source_status}. Inflación general se usa como proxy macroeconómico y no sustituye "
